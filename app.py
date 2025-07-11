@@ -2,67 +2,121 @@ import streamlit as st
 import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
-# --- Filtrage par clustering to isolate main cluster sans sklearn ---
-# On regroupe les adresses proches (<2000m) en clusters par union-find
-coords = df[['lat','lon']].to_numpy()
-threshold = 2000  # mètres
-# Union-Find
-parent = list(range(len(df)))
-def find(i):
-    while parent[i] != i:
-        parent[i] = parent[parent[i]]
-        i = parent[i]
-    return i
+import io
 
-def union(i,j):
+# --- Configuration de la page ---
+st.set_page_config(page_title="Organisateur d'adresses", layout="wide")
+st.title("Tournées organisées (sans carte)")
+
+# --- Téléversement du fichier Excel ---
+uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
+if not uploaded:
+    st.stop()
+try:
+    df = pd.read_excel(uploaded)
+except Exception as e:
+    st.error(f"Erreur lecture du fichier Excel : {e}")
+    st.stop()
+
+# --- Sélection des colonnes ---
+st.sidebar.header("Paramètres des colonnes")
+cols = df.columns.tolist()
+addr_col = st.sidebar.selectbox("Colonne adresse", cols)
+pc_col   = st.sidebar.selectbox("Colonne code postal", cols)
+city_col = st.sidebar.selectbox("Colonne ville", cols)
+if not all([addr_col, pc_col, city_col]):
+    st.error("Merci de sélectionner les 3 colonnes d'adresses.")
+    st.stop()
+
+# --- Construction de l'adresse complète ---
+df['full_address'] = (
+    df[addr_col].astype(str) + ", " +
+    df[pc_col].astype(str) + " " +
+    df[city_col].astype(str) + ", France"
+)
+
+# --- Géocodage des adresses ---
+geolocator = Nominatim(user_agent="streamlit_app")
+@st.cache_data
+def geocode(addr):
+    try:
+        loc = geolocator.geocode(addr, timeout=10)
+        return (loc.latitude, loc.longitude)
+    except:
+        return (None, None)
+
+with st.spinner("Géocodage en cours..."):
+    coords = [geocode(a) for a in df['full_address']]
+    df[['lat','lon']] = pd.DataFrame(coords)
+
+# Filtrer adresses géocodées
+df = df.dropna(subset=['lat','lon']).reset_index(drop=True)
+if df.empty:
+    st.error("Aucune adresse valide n'a pu être géocodée.")
+    st.stop()
+st.success(f"{len(df)} adresses géocodées.")
+
+# --- Clustering Union-Find pour isoler le cluster principal ---
+# On regroupe tout point à moins de 2km
+n = len(df)
+parent = list(range(n))
+
+def find(i):
+    if parent[i] != i:
+        parent[i] = find(parent[i])
+    return parent[i]
+
+def union(i, j):
     ri, rj = find(i), find(j)
     if ri != rj:
         parent[rj] = ri
 
-# Construire les liaisons
-for i in range(len(df)):
-    for j in range(i+1, len(df)):
-        if geodesic((coords[i][0], coords[i][1]), (coords[j][0], coords[j][1])).meters <= threshold:
+# Appliquer clustering
+threshold = 2000  # mètres
+for i in range(n):
+    for j in range(i+1, n):
+        if geodesic((df.at[i,'lat'], df.at[i,'lon']), (df.at[j,'lat'], df.at[j,'lon'])).meters <= threshold:
             union(i, j)
-# Regrouper par racine
+# Collecte des groupes
 groups = {}
-for i in range(len(df)):
+for i in range(n):
     root = find(i)
     groups.setdefault(root, []).append(i)
-# Garder le plus grand groupe
-groups = {r: idxs for r, idxs in groups.items() if r != -1}
-main = max(groups.items(), key=lambda kv: len(kv[1]))[1]
-# Sélectionner df_in et df_out
-df_in = df.loc[main].reset_index(drop=True)
-df_out = df.drop(main).reset_index(drop=True)
+# Sélection du plus grand cluster
+groups_list = list(groups.values())
+main_cluster = max(groups_list, key=len)
+# Sélection des adresses principales et hors secteur
+df_in = df.loc[main_cluster].reset_index(drop=True)
+remaining = set(range(n)) - set(main_cluster)
+df_out = df.loc[list(remaining)].reset_index(drop=True)
 if not df_out.empty:
     st.warning("Adresses hors secteur principal :")
     st.dataframe(df_out[[addr_col, pc_col, city_col]])
-# --- Tri glouton (nearest neighbor) --- (nearest neighbor) ---
+
+# --- Tri glouton (Nearest Neighbor) ---
 def greedy_order(df_pts, start_idx):
     visited = [start_idx]
-    remaining = set(range(len(df_pts))) - {start_idx}
-    while remaining:
+    rem = set(range(len(df_pts))) - {start_idx}
+    while rem:
         last = visited[-1]
-        # calculer distances aux non-visités
-        dists = {i: geodesic(
-            (df_pts.at[last,'lat'], df_pts.at[last,'lon']),
-            (df_pts.at[i,'lat'], df_pts.at[i,'lon'])
-        ).meters for i in remaining}
+        # calcul des distances
+        dists = {i: geodesic((df_pts.at[last,'lat'], df_pts.at[last,'lon']),
+                              (df_pts.at[i,'lat'], df_pts.at[i,'lon'])).meters
+                 for i in rem}
         nxt = min(dists, key=dists.get)
         visited.append(nxt)
-        remaining.remove(nxt)
+        rem.remove(nxt)
     return visited
 
-# Déterminer index de départ : adresse la plus centrale (min somme distances)
+# Déterminer point de départ : adresse la plus centrale (min sum dist)
 sum_dists = df_in.apply(
     lambda r: df_in.apply(
         lambda x: geodesic((r['lat'],r['lon']), (x['lat'],x['lon'])).meters,
         axis=1
     ).sum(), axis=1
 )
-start_idx = int(sum_dists.idxmin())
-order = greedy_order(df_in, start_idx)
+start_index = int(sum_dists.idxmin())
+order = greedy_order(df_in, start_index)
 df_route = df_in.loc[order].reset_index(drop=True)
 
 # --- Affichage du tableau optimisé ---
