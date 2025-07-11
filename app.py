@@ -267,24 +267,104 @@ st.markdown("---")
 st.subheader("📊 Aperçu des données")
 st.dataframe(df.head(10), use_container_width=True)
 
-# Détection automatique des colonnes
-columns = df.columns.tolist()
-if len(columns) < 3:
-    st.error("❌ Le fichier doit contenir au moins 3 colonnes (adresse, code postal, ville)")
+# Détection intelligente des colonnes
+def detect_columns_smart(df):
+    """Détection intelligente des colonnes adresse, code postal et ville"""
+    columns = df.columns.tolist()
+    
+    # Mots-clés pour la détection
+    address_keywords = ['adresse', 'address', 'rue', 'street', 'voie', 'avenue', 'boulevard', 'chemin', 'client']
+    postal_keywords = ['postal', 'cp', 'code', 'zip', 'postcode']
+    city_keywords = ['ville', 'city', 'commune', 'localite', 'locality']
+    
+    address_col = None
+    postal_col = None
+    city_col = None
+    
+    # Recherche par mots-clés
+    for col in columns:
+        col_lower = col.lower()
+        
+        # Détection adresse
+        if not address_col:
+            for keyword in address_keywords:
+                if keyword in col_lower:
+                    address_col = col
+                    break
+        
+        # Détection code postal
+        if not postal_col:
+            for keyword in postal_keywords:
+                if keyword in col_lower:
+                    postal_col = col
+                    break
+        
+        # Détection ville
+        if not city_col:
+            for keyword in city_keywords:
+                if keyword in col_lower:
+                    city_col = col
+                    break
+    
+    return address_col, postal_col, city_col
+
+# Détection automatique intelligente
+address_col, postal_col, city_col = detect_columns_smart(df)
+
+# Si détection automatique échoue, permettre sélection manuelle
+if not all([address_col, postal_col, city_col]):
+    st.warning("⚠️ Détection automatique des colonnes échouée. Sélection manuelle requise.")
+    
+    col1, col2, col3 = st.columns(3)
+    columns = df.columns.tolist()
+    
+    with col1:
+        address_col = st.selectbox("📍 Colonne Adresse", columns, key="manual_address")
+    with col2:
+        postal_col = st.selectbox("📮 Colonne Code Postal", columns, key="manual_postal")
+    with col3:
+        city_col = st.selectbox("🏙️ Colonne Ville", columns, key="manual_city")
+    
+    if not all([address_col, postal_col, city_col]):
+        st.error("❌ Veuillez sélectionner toutes les colonnes requises")
+        st.stop()
+    
+    st.info(f"📍 Colonnes sélectionnées : {address_col}, {postal_col}, {city_col}")
+else:
+    st.success(f"✅ Colonnes détectées automatiquement : {address_col}, {postal_col}, {city_col}")
+
+# Validation et nettoyage des données
+st.markdown("---")
+st.subheader("🧹 Nettoyage des données")
+
+# Vérification des données manquantes
+missing_data = df[[address_col, postal_col, city_col]].isnull().sum()
+if missing_data.any():
+    st.warning("⚠️ Données manquantes détectées :")
+    for col, count in missing_data.items():
+        if count > 0:
+            st.write(f"- {col}: {count} valeurs manquantes")
+
+# Nettoyage des données
+df_clean = df.dropna(subset=[address_col, postal_col, city_col]).copy()
+
+# Nettoyage des codes postaux (garder seulement les chiffres)
+df_clean[postal_col] = df_clean[postal_col].astype(str).str.extract('(\d+)')[0]
+df_clean = df_clean.dropna(subset=[postal_col])
+
+# Suppression des lignes avec des valeurs vides après nettoyage
+df_clean = df_clean[df_clean[address_col].astype(str).str.strip() != '']
+df_clean = df_clean[df_clean[city_col].astype(str).str.strip() != '']
+df_clean = df_clean[df_clean[postal_col].astype(str).str.strip() != '']
+
+st.info(f"📊 Données nettoyées : {len(df_clean)}/{len(df)} adresses valides")
+
+if len(df_clean) == 0:
+    st.error("❌ Aucune donnée valide après nettoyage")
     st.stop()
 
-# Assignation automatique des colonnes (prendre les 3 premières)
-address_col = columns[0]
-postal_col = columns[1]
-city_col = columns[2]
-
-st.info(f"📍 Colonnes détectées automatiquement : {address_col}, {postal_col}, {city_col}")
-
-# Validation des données
-if df.isnull().any().any():
-    st.warning("⚠️ Certaines cellules sont vides, elles seront ignorées")
-    df = df.dropna(subset=[address_col, postal_col, city_col])
-    st.info(f"📊 Données nettoyées : {len(df)} adresses valides")
+# Affichage des données nettoyées
+st.dataframe(df_clean[[address_col, postal_col, city_col]].head(10), use_container_width=True)
 
 # Limitation raisonnable pour éviter les quotas API
 MAX_ADDRESSES = 200
