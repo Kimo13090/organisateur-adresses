@@ -12,6 +12,10 @@ st.title("Tournées organisées (sans carte)")
 uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
 if not uploaded:
     st.stop()
+[df code continues...]
+uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
+if not uploaded:
+    st.stop()
 try:
     df = pd.read_excel(uploaded)
 except Exception as e:
@@ -56,44 +60,30 @@ if df.empty:
     st.stop()
 st.success(f"{len(df)} adresses géocodées.")
 
-# --- Clustering Union-Find pour isoler le cluster principal ---
-# On regroupe tout point à moins de 2km
-n = len(df)
-parent = list(range(n))
-
-def find(i):
-    if parent[i] != i:
-        parent[i] = find(parent[i])
-    return parent[i]
-
-def union(i, j):
-    ri, rj = find(i), find(j)
-    if ri != rj:
-        parent[rj] = ri
-
-# Appliquer clustering
-threshold = 2000  # mètres
-for i in range(n):
-    for j in range(i+1, n):
-        if geodesic((df.at[i,'lat'], df.at[i,'lon']), (df.at[j,'lat'], df.at[j,'lon'])).meters <= threshold:
-            union(i, j)
-# Collecte des groupes
-groups = {}
-for i in range(n):
-    root = find(i)
-    groups.setdefault(root, []).append(i)
-# Sélection du plus grand cluster
-groups_list = list(groups.values())
-main_cluster = max(groups_list, key=len)
-# Sélection des adresses principales et hors secteur
-df_in = df.loc[main_cluster].reset_index(drop=True)
-remaining = set(range(n)) - set(main_cluster)
-df_out = df.loc[list(remaining)].reset_index(drop=True)
+# --- Filtrage automatique des adresses hors secteur via distance au centroïde ---
+# Calcul du centroïde
+centroid_lat = df['lat'].mean()
+centroid_lon = df['lon'].mean()
+# Calcul des distances au centroïde
+df['dist_centroid'] = df.apply(
+    lambda r: geodesic((r['lat'], r['lon']), (centroid_lat, centroid_lon)).meters,
+    axis=1
+)
+# Seuil dynamique : moyenne + 1.5 * écart-type
+dist_mean = df['dist_centroid'].mean()
+dist_std  = df['dist_centroid'].std()
+threshold = dist_mean + 1.5 * dist_std
+# Sélection du secteur principal
+df_in = df[df['dist_centroid'] <= threshold].reset_index(drop=True)
+df_out = df[df['dist_centroid'] > threshold].reset_index(drop=True)
 if not df_out.empty:
-    st.warning("Adresses hors secteur principal :")
-    st.dataframe(df_out[[addr_col, pc_col, city_col]])
+    st.warning(f"Adresses hors secteur (> {threshold:.0f} m) :")
+    st.dataframe(df_out[[addr_col, pc_col, city_col, 'dist_centroid']])
+if df_in.empty:
+    st.error("Aucune adresse dans le secteur principal après filtrage.")
+    st.stop()
 
-# --- Tri glouton (Nearest Neighbor) ---
+# --- Tri glouton (Nearest Neighbor) sur le secteur principal --- (Nearest Neighbor) ---
 def greedy_order(df_pts, start_idx):
     visited = [start_idx]
     rem = set(range(len(df_pts))) - {start_idx}
