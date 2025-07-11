@@ -79,26 +79,43 @@ st.info(f"{len(df_in)} adresses dans le secteur (<= {threshold} m).")
 if df_in.empty:
     st.stop()
 
-# Optimisation de l'ordre via OSRM Trip API
-with st.spinner("Optimisation de l'ordre de tournée..."):
+# --- Choix du point de départ ---
+st.sidebar.subheader("Point de départ de la tournée")
+start_address = st.sidebar.selectbox(
+    "Sélectionnez le point de départ", df_in[address_col].tolist(), index=0
+)
+# Réordonner df_in pour placer le point de départ en premier
+df_start = df_in[df_in[address_col] == start_address]
+df_rest = df_in[df_in[address_col] != start_address]
+df_ordered = pd.concat([df_start, df_rest], ignore_index=True)
+
+# Optimisation de l'ordre via OSRM Trip API (source fixé au premier point)
+with st.spinner("Optimisation de l'ordre de tournée via OSRM Trip..."):
     try:
-        wpts = ";".join(f"{lon},{lat}" for lat, lon in zip(df_in['Latitude'], df_in['Longitude']))
-        trip_url = f"http://router.project-osrm.org/trip/v1/driving/{wpts}?source=first&roundtrip=false&overview=full&geometries=geojson"
+        wpts = ";".join(
+            f"{lon},{lat}" for lat, lon in zip(df_ordered['Latitude'], df_ordered['Longitude'])
+        )
+        # source=first force le départ au premier waypoint\ n        trip_url = f"http://router.project-osrm.org/trip/v1/driving/{wpts}?source=first&roundtrip=false&overview=full&geometries=geojson"
         res = requests.get(trip_url, timeout=15)
         res.raise_for_status()
         data = res.json()
-        order = data['trips'][0].get('waypoint_order', list(range(len(df_in))))
+        # OSRM Trip renvoie l'ordre des waypoints hors point de départ, on l'insère en tête
+        waypoint_order = data['trips'][0].get('waypoint_order', list(range(1, len(df_ordered))))
+        order = [0] + [i+1 for i in waypoint_order]
     except Exception:
-        # Fallback tri angulaire
+        # Fallback tri angulaire autour du départ
         import math
-        origin_lat, origin_lon = origin
-        df_temp = df_in.copy()
-        df_temp['angle'] = df_temp.apply(
+        origin_lat, origin_lon = df_ordered.loc[0, ['Latitude','Longitude']]
+        df_tmp = df_ordered.copy()
+        df_tmp['angle'] = df_tmp.apply(
             lambda r: math.atan2(r['Longitude']-origin_lon, r['Latitude']-origin_lat), axis=1
         )
-        df_temp = df_temp.sort_values('angle')
-        order = df_temp.index.tolist()
-# DataFrame ordonné
+        df_tmp = df_tmp.sort_values('angle')
+        # On replace le point de départ en tête
+        order = [df_tmp.index.get_loc(0)] + [i for i in df_tmp.index if i != 0]
+
+# DataFrame ordonné final
+df_opt = df_ordered.iloc[order].reset_index(drop=True)
 df_opt = df_in.iloc[order].reset_index(drop=True)
 
 # Affichage du tableau optimisé
