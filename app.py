@@ -70,10 +70,12 @@ if df_clean.empty:
     st.stop()
 st.success(f"{len(df_clean)} adresses géocodées avec succès.")
 
-# Calcul de l'ordre de la tournée via OSRM Trip API ou fallback NN
+# Calcul de l'ordre de la tournée via OSRM Trip API
 with st.spinner("Optimisation de la tournée..."):
     try:
-        waypoints = ";".join(f"{lon},{lat}" for lat, lon in zip(df_clean["Latitude"], df_clean["Longitude"]))
+        waypoints = ";".join(
+            f"{lon},{lat}" for lat, lon in zip(df_clean["Latitude"], df_clean["Longitude"])
+        )
         trip_url = (
             f"http://router.project-osrm.org/trip/v1/driving/{waypoints}" +
             "?source=first&roundtrip=false&overview=full&geometries=geojson"
@@ -84,25 +86,22 @@ with st.spinner("Optimisation de la tournée..."):
         trip = data["trips"][0]
         order = trip.get("waypoint_order", list(range(len(df_clean))))
     except Exception:
-        # Fallback nearest neighbor si l'API Trip échoue
-        def nearest_neighbor(df_nn):
-            seq = [df_nn.iloc[0]]
-            rem = df_nn.iloc[1:].copy().reset_index(drop=True)
-            while not rem.empty:
-                last = seq[-1]
-                origin = (last["Latitude"], last["Longitude"])
-                dists = rem.apply(
-                    lambda r: geodesic(origin, (r["Latitude"], r["Longitude"])).meters,
-                    axis=1
-                )
-                idx_min = dists.idxmin()
-                seq.append(rem.loc[idx_min])
-                rem = rem.drop(idx_min).reset_index(drop=True)
-            return pd.DataFrame(seq)
-        df_seq = nearest_neighbor(df_clean)
-        order = df_seq.index.tolist()
+        st.warning("OSRM Trip failed, fallback par tri angulaire autour du point de départ.")
+        import math
+        origin = df_clean.iloc[0]
+        # Calcul d'un angle polaire pour chaque point
+        def calc_angle(row):
+            return math.atan2(
+                row["Longitude"] - origin["Longitude"],
+                row["Latitude"] - origin["Latitude"]
+            )
+        df_temp = df_clean.copy()
+        df_temp["angle"] = df_temp.apply(calc_angle, axis=1)
+        df_temp = df_temp.sort_values("angle").reset_index()
+        order = df_temp["index"].tolist()
 
 # DataFrame ordonné
+df_opt = df_clean.iloc[order].reset_index(drop=True)
 df_opt = df_clean.iloc[order].reset_index(drop=True)
 
 # Affichage du tableau optimisé
