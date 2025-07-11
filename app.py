@@ -12,10 +12,6 @@ st.title("Tournées organisées (sans carte)")
 uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
 if not uploaded:
     st.stop()
-[df code continues...]
-uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
-if not uploaded:
-    st.stop()
 try:
     df = pd.read_excel(uploaded)
 except Exception as e:
@@ -77,28 +73,29 @@ threshold = dist_mean + 1.5 * dist_std
 df_in = df[df['dist_centroid'] <= threshold].reset_index(drop=True)
 df_out = df[df['dist_centroid'] > threshold].reset_index(drop=True)
 if not df_out.empty:
-    st.warning(f"Adresses hors secteur (> {threshold:.0f} m) :")
+    st.warning(f"Adresses hors secteur (> {threshold:.0f} m) :")
     st.dataframe(df_out[[addr_col, pc_col, city_col, 'dist_centroid']])
 if df_in.empty:
     st.error("Aucune adresse dans le secteur principal après filtrage.")
     st.stop()
 
-# --- Tri glouton (Nearest Neighbor) sur le secteur principal --- (Nearest Neighbor) ---
+# --- Tri glouton (Nearest Neighbor) ---
 def greedy_order(df_pts, start_idx):
     visited = [start_idx]
-    rem = set(range(len(df_pts))) - {start_idx}
-    while rem:
+    remaining = set(range(len(df_pts))) - {start_idx}
+    while remaining:
         last = visited[-1]
-        # calcul des distances
-        dists = {i: geodesic((df_pts.at[last,'lat'], df_pts.at[last,'lon']),
-                              (df_pts.at[i,'lat'], df_pts.at[i,'lon'])).meters
-                 for i in rem}
+        dists = {
+            i: geodesic((df_pts.at[last,'lat'], df_pts.at[last,'lon']),
+                         (df_pts.at[i,'lat'], df_pts.at[i,'lon'])).meters
+            for i in remaining
+        }
         nxt = min(dists, key=dists.get)
         visited.append(nxt)
-        rem.remove(nxt)
+        remaining.remove(nxt)
     return visited
 
-# Déterminer point de départ : adresse la plus centrale (min sum dist)
+# Déterminer le point de départ : adresse la plus centrale (min somme distances)
 sum_dists = df_in.apply(
     lambda r: df_in.apply(
         lambda x: geodesic((r['lat'],r['lon']), (x['lat'],x['lon'])).meters,
