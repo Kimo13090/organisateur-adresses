@@ -55,27 +55,48 @@ st.success(f"{len(df_clean)} adresses géocodées avec succès.")
 # Optimisation globale via OSRM Trip API
 with st.spinner("Optimisation de la tournée (OSRM Trip)..."):
     # Préparer la chaîne de waypoints lon,lat;...
-    waypoints = ";".join(f"{lon},{lat}" for lat, lon in zip(df_clean["Latitude"], df_clean["Longitude"]))
+    waypoints = ";".join(f"{lon},{lat}" for lat, lon in zip(df_clean["Longitude"], df_clean["Latitude"]))
     trip_url = (
         f"http://router.project-osrm.org/trip/v1/driving/{waypoints}"
         f"?source=first&roundtrip=false&overview=full&geometries=geojson"
     )
-    res = requests.get(trip_url, timeout=15).json()
-    if "trips" not in res or not res["trips"]:
-        st.warning("Optimisation OSRM a échoué, utilisation de l'ordre original.")
-        order = list(range(len(df_clean)))
-        route_pts = list(zip(df_clean["Latitude"], df_clean["Longitude"]))
-    else:
-        trip = res["trips"][0]
-        # Ordre optimisé des waypoints
-        order = trip.get("waypoint_order", list(range(len(df_clean))))
-        # Géométrie complète
-        coords_geo = trip["geometry"]["coordinates"]  # [ [lon, lat], ... ]
-        route_pts = [(lat, lon) for lon, lat in coords_geo]
-    # Réordonner le DataFrame
-    df_opt = df_clean.iloc[order].reset_index(drop=True)
+    try:
+        res = requests.get(trip_url, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        if "trips" in data and data["trips"]:
+            trip = data["trips"][0]
+            order = trip.get("waypoint_order", list(range(len(df_clean))))
+            coords_geo = trip["geometry"]["coordinates"]
+            route_pts = [(lat, lon) for lon, lat in coords_geo]
+            df_opt = df_clean.iloc[order].reset_index(drop=True)
+        else:
+            raise ValueError("Empty trips")
+    except (requests.RequestException, ValueError, Exception) as e:
+        st.warning("Impossible d'utiliser OSRM Trip, utilisation d'un itinéraire par plus proche voisin.")
+        # Fallback Nearest Neighbor
+        def nearest_neighbor(df_nn):
+            seq = [df_nn.iloc[0]]
+            reste = df_nn.iloc[1:].copy()
+            while not reste.empty:
+                last = seq[-1]
+                origin = (last["Latitude"], last["Longitude"])
+                dists = reste.apply(
+                    lambda r: geodesic(origin, (r["Latitude"], r["Longitude"])) .meters,
+                    axis=1
+                )
+                idx_min = dists.idxmin()
+                seq.append(reste.loc[idx_min])
+                reste = reste.drop(idx_min)
+            return pd.DataFrame(seq)
+        df_opt = nearest_neighbor(df_clean).reset_index(drop=True)
+        route_pts = list(zip(df_opt["Latitude"], df_opt["Longitude"]))
 
 # Affichage du tableau optimisé
+st.subheader("Adresses organisées pour la tournée")
+st.dataframe(
+    df_opt[["Adresse du client", "CPSTCMN", "LVIL", "Latitude", "Longitude"]], use_container_width=True
+)
 st.subheader("Adresses organisées pour la tournée")
 st.dataframe(
     df_opt[["Adresse du client", "CPSTCMN", "LVIL", "Latitude", "Longitude"]], use_container_width=True
