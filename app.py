@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
+from sklearn.cluster import DBSCAN
 import io
 
 # --- Configuration de la page ---
@@ -15,7 +16,7 @@ if not uploaded:
 try:
     df = pd.read_excel(uploaded)
 except Exception as e:
-    st.error(f"Erreur lecture du fichier Excel : {e}")
+    st.error(f"Erreur lecture du fichier Excel : {e}")
     st.stop()
 
 # --- Sélection des colonnes ---
@@ -35,75 +36,69 @@ df['full_address'] = (
     df[city_col].astype(str) + ", France"
 )
 
-# --- Géocodage des adresses ---
+# --- Géocodage des adresses avec cache ---
 geolocator = Nominatim(user_agent="streamlit_app")
 @st.cache_data
-# Mise en cache pour accélérer
 def geocode(addr):
     try:
         loc = geolocator.geocode(addr, timeout=10)
-        if loc:
-            return loc.latitude, loc.longitude
+        return (loc.latitude, loc.longitude)
     except:
-        pass
-    return None, None
+        return (None, None)
 
 with st.spinner("Géocodage en cours..."):
-    coords = [geocode(a) for a in df['full_address']]
-df['lat'], df['lon'] = zip(*coords)
+    df[['lat','lon']] = pd.DataFrame([geocode(a) for a in df['full_address']])
+
+# Filtrer adresses géocodées
 df = df.dropna(subset=['lat','lon']).reset_index(drop=True)
 if df.empty:
-    st.error("Aucune adresse n'a pu être géocodée.")
+    st.error("Aucune adresse valide n'a pu être géocodée.")
     st.stop()
 st.success(f"{len(df)} adresses géocodées.")
 
-# --- Filtrage des adresses hors secteur (>5km du centroïde) ---
-centroid = (df['lat'].mean(), df['lon'].mean())
-df['dist_to_center'] = df.apply(
-    lambda row: geodesic((row['lat'], row['lon']), centroid).meters,
-    axis=1
-)
-df_in = df[df['dist_to_center'] <= 5000].reset_index(drop=True)
-df_out = df[df['dist_to_center'] > 5000].reset_index(drop=True)
-if not df_out.empty:
-    st.warning("Adresses hors secteur (>5km du centre) :")
-    st.dataframe(df_out[[addr_col, pc_col, city_col, 'dist_to_center']])
-if df_in.empty:
-    st.error("Aucune adresse dans le secteur.")
+# --- Filtrage par clustering DBSCAN pour garder le cluster principal ---
+coords = df[['lat','lon']].to_numpy()
+# eps en degrés ≈ 0.02 deg ~ 2.2km
+db = DBSCAN(eps=0.02, min_samples=2).fit(coords)
+labels = db.labels_
+df['cluster'] = labels
+# Choisir le cluster le plus grand (hors -1 noise)
+cluster_sizes = df[df['cluster']!=-1]['cluster'].value_counts()
+if cluster_sizes.empty:
+    st.error("Aucun cluster principal trouvé. Toutes adresses sont isolées.")
     st.stop()
+main_cluster = int(cluster_sizes.idxmax())
+df_in = df[df['cluster']==main_cluster].reset_index(drop=True)
+df_out = df[df['cluster']!=main_cluster].reset_index(drop=True)
+if not df_out.empty:
+    st.warning("Adresses hors secteur principal :")
+    st.dataframe(df_out[[addr_col, pc_col, city_col]])
 
-# --- Fonction de tri glouton (nearest neighbor) ---
-def nearest_neighbor_order(df_pts, start_idx=0):
+# --- Tri glouton (nearest neighbor) ---
+def greedy_order(df_pts, start_idx):
     visited = [start_idx]
     remaining = set(range(len(df_pts))) - {start_idx}
     while remaining:
         last = visited[-1]
-        # calcul distances aux non-visités
-        dists = {
-            i: geodesic(
-                (df_pts.at[last,'lat'], df_pts.at[last,'lon']),
-                (df_pts.at[i,'lat'], df_pts.at[i,'lon'])
-            ).meters
-            for i in remaining
-        }
-        next_idx = min(dists, key=dists.get)
-        visited.append(next_idx)
-        remaining.remove(next_idx)
+        # calculer distances aux non-visités
+        dists = {i: geodesic(
+            (df_pts.at[last,'lat'], df_pts.at[last,'lon']),
+            (df_pts.at[i,'lat'], df_pts.at[i,'lon'])
+        ).meters for i in remaining}
+        nxt = min(dists, key=dists.get)
+        visited.append(nxt)
+        remaining.remove(nxt)
     return visited
 
-# --- Détermination du point de départ ---
-# par défaut, on prend l'adresse la plus centrale (distance minimale au centroïde)
-df_in['sum_distances'] = df_in.apply(
-    lambda row: df_in.apply(
-        lambda r: geodesic((row['lat'],row['lon']), (r['lat'],r['lon'])).meters,
+# Déterminer index de départ : adresse la plus centrale (min somme distances)
+sum_dists = df_in.apply(
+    lambda r: df_in.apply(
+        lambda x: geodesic((r['lat'],r['lon']), (x['lat'],x['lon'])).meters,
         axis=1
-    ).sum(),
-    axis=1
+    ).sum(), axis=1
 )
-start_index = int(df_in['sum_distances'].idxmin())
-
-# --- Calcul de l'ordre de tournée ---
-order = nearest_neighbor_order(df_in, start_index)
+start_idx = int(sum_dists.idxmin())
+order = greedy_order(df_in, start_idx)
 df_route = df_in.loc[order].reset_index(drop=True)
 
 # --- Affichage du tableau optimisé ---
