@@ -2,79 +2,43 @@ import streamlit as st
 import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
-from sklearn.cluster import DBSCAN
-import io
-
-# --- Configuration de la page ---
-st.set_page_config(page_title="Organisateur d'adresses", layout="wide")
-st.title("Tournées organisées (sans carte)")
-
-# --- Téléversement du fichier Excel ---
-uploaded = st.file_uploader("Chargez un fichier Excel (.xlsx)", type=["xlsx"])
-if not uploaded:
-    st.stop()
-try:
-    df = pd.read_excel(uploaded)
-except Exception as e:
-    st.error(f"Erreur lecture du fichier Excel : {e}")
-    st.stop()
-
-# --- Sélection des colonnes ---
-st.sidebar.header("Paramètres des colonnes")
-cols = df.columns.tolist()
-addr_col = st.sidebar.selectbox("Colonne adresse", cols)
-pc_col   = st.sidebar.selectbox("Colonne code postal", cols)
-city_col = st.sidebar.selectbox("Colonne ville", cols)
-if not all([addr_col, pc_col, city_col]):
-    st.error("Merci de sélectionner les 3 colonnes d'adresses.")
-    st.stop()
-
-# --- Construction de l'adresse complète ---
-df['full_address'] = (
-    df[addr_col].astype(str) + ", " +
-    df[pc_col].astype(str) + " " +
-    df[city_col].astype(str) + ", France"
-)
-
-# --- Géocodage des adresses avec cache ---
-geolocator = Nominatim(user_agent="streamlit_app")
-@st.cache_data
-def geocode(addr):
-    try:
-        loc = geolocator.geocode(addr, timeout=10)
-        return (loc.latitude, loc.longitude)
-    except:
-        return (None, None)
-
-with st.spinner("Géocodage en cours..."):
-    df[['lat','lon']] = pd.DataFrame([geocode(a) for a in df['full_address']])
-
-# Filtrer adresses géocodées
-df = df.dropna(subset=['lat','lon']).reset_index(drop=True)
-if df.empty:
-    st.error("Aucune adresse valide n'a pu être géocodée.")
-    st.stop()
-st.success(f"{len(df)} adresses géocodées.")
-
-# --- Filtrage par clustering DBSCAN pour garder le cluster principal ---
+# --- Filtrage par clustering to isolate main cluster sans sklearn ---
+# On regroupe les adresses proches (<2000m) en clusters par union-find
 coords = df[['lat','lon']].to_numpy()
-# eps en degrés ≈ 0.02 deg ~ 2.2km
-db = DBSCAN(eps=0.02, min_samples=2).fit(coords)
-labels = db.labels_
-df['cluster'] = labels
-# Choisir le cluster le plus grand (hors -1 noise)
-cluster_sizes = df[df['cluster']!=-1]['cluster'].value_counts()
-if cluster_sizes.empty:
-    st.error("Aucun cluster principal trouvé. Toutes adresses sont isolées.")
-    st.stop()
-main_cluster = int(cluster_sizes.idxmax())
-df_in = df[df['cluster']==main_cluster].reset_index(drop=True)
-df_out = df[df['cluster']!=main_cluster].reset_index(drop=True)
+threshold = 2000  # mètres
+# Union-Find
+parent = list(range(len(df)))
+def find(i):
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+def union(i,j):
+    ri, rj = find(i), find(j)
+    if ri != rj:
+        parent[rj] = ri
+
+# Construire les liaisons
+for i in range(len(df)):
+    for j in range(i+1, len(df)):
+        if geodesic((coords[i][0], coords[i][1]), (coords[j][0], coords[j][1])).meters <= threshold:
+            union(i, j)
+# Regrouper par racine
+groups = {}
+for i in range(len(df)):
+    root = find(i)
+    groups.setdefault(root, []).append(i)
+# Garder le plus grand groupe
+groups = {r: idxs for r, idxs in groups.items() if r != -1}
+main = max(groups.items(), key=lambda kv: len(kv[1]))[1]
+# Sélectionner df_in et df_out
+df_in = df.loc[main].reset_index(drop=True)
+df_out = df.drop(main).reset_index(drop=True)
 if not df_out.empty:
     st.warning("Adresses hors secteur principal :")
     st.dataframe(df_out[[addr_col, pc_col, city_col]])
-
-# --- Tri glouton (nearest neighbor) ---
+# --- Tri glouton (nearest neighbor) --- (nearest neighbor) ---
 def greedy_order(df_pts, start_idx):
     visited = [start_idx]
     remaining = set(range(len(df_pts))) - {start_idx}
