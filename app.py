@@ -3,6 +3,7 @@ import pandas as pd
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import time
+import io
 
 st.title("Organisateur d'adresses pour repérages")
 
@@ -66,8 +67,18 @@ if uploaded_file:
             st.subheader("Adresses organisées selon la proximité :")
             st.dataframe(df_organise[["Adresse du client", "CPSTCMN", "LVIL", "Latitude", "Longitude"]])
 
-            csv = df_organise.to_csv(index=False).encode('utf-8')
-            st.download_button("Télécharger le fichier organisé", data=csv, file_name="reperage_organise.csv", mime="text/csv")
+            # Générer un fichier Excel en mémoire
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_organise.to_excel(writer, index=False, sheet_name='Repérage')
+            output.seek(0)
+
+            st.download_button(
+                "Télécharger le fichier organisé", 
+                data=output, 
+                file_name="reperage_organise.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         else:
             st.error("Aucune adresse valide n'a pu être géocodée.")
