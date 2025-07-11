@@ -4,7 +4,9 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import time
 import io
+import requests
 import folium
+from folium.plugins import PolyLineTextPath
 from streamlit_folium import st_folium
 
 # Configuration de la page
@@ -87,19 +89,52 @@ if uploaded_file:
                 use_container_width=True
             )
 
-            # Création de la carte interactive
+            # Création d'une carte routière via OSRM
             coords = list(zip(df_organise["Latitude"], df_organise["Longitude"]))
-            m = folium.Map(location=coords[0], zoom_start=12)
-            folium.PolyLine(coords, color="blue", weight=4, opacity=0.7).add_to(m)
-            for i, (lat, lon) in enumerate(coords):
-                folium.Marker(
-                    location=(lat, lon),
-                    popup=f"{i+1} – {df_organise['Adresse du client'].iloc[i]}",
-                    tooltip=str(i+1)
-                ).add_to(m)
+            route_line = []
+            for i in range(len(coords) - 1):
+                start, end = coords[i], coords[i+1]
+                url = (
+                    f"http://router.project-osrm.org/route/v1/driving/"
+                    f"{start[1]},{start[0]};{end[1]},{end[0]}?overview=full&geometries=geojson"
+                )
+                try:
+                    res = requests.get(url, timeout=5).json()
+                    seg = res['routes'][0]['geometry']['coordinates']
+                    route_line.extend([(lat, lon) for lon, lat in seg])
+                except:
+                    # fallback segment direct
+                    route_line.extend([start, end])
 
-            st.subheader("Visualisation de la tournée")
-            st_folium(m, width=700, height=500)
+            # Fonction de création de carte mise en cache
+            @st.cache_data(show_spinner=False)
+            def create_map(route_pts, marker_pts):
+                m = folium.Map(location=marker_pts[0], zoom_start=12)
+                # Trace de la route
+                line = folium.PolyLine(route_pts, color="blue", weight=4, opacity=0.7)
+                m.add_child(line)
+                # Flèches le long du tracé
+                PolyLineTextPath(
+                    line, '   ▶   ', repeat=True, offset=6,
+                    attributes={'fill': 'blue', 'font-weight': 'bold', 'font-size': '16'}
+                ).add_to(m)
+                # Marqueurs numérotés
+                for idx, (lat, lon) in enumerate(marker_pts):
+                    color = "green" if idx == 0 else ("red" if idx == len(marker_pts)-1 else "blue")
+                    icon_html = (
+                        f"<div style='background:{color};color:white;"
+                    f"border-radius:50%;width:24px;height:24px;text-align:center;line-height:24px'>"
+                    f"{idx+1}</div>"
+                    )
+                    folium.Marker(
+                        location=(lat, lon),
+                        icon=folium.DivIcon(html=icon_html)
+                    ).add_to(m)
+                return m
+
+            carte = create_map(route_line, coords)
+            st.subheader("Visualisation interactive de la tournée (véhicule)")
+            st_folium(carte, width=800, height=600)
 
             # Génération et téléchargement du fichier Excel
             output = io.BytesIO()
@@ -117,3 +152,4 @@ if uploaded_file:
             st.error("Aucune adresse valide n'a pu être géocodée.")
     else:
         st.error("Le fichier ne contient pas les colonnes attendues : 'Adresse du client', 'CPSTCMN', 'LVIL'")
+
