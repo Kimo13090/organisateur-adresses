@@ -12,6 +12,14 @@ import logging
 from typing import Tuple, List, Optional
 import warnings
 
+# Gestion des imports optionnels
+try:
+    from sklearn.cluster import DBSCAN
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +43,13 @@ st.markdown("---")
 def geocode_address(address: str, max_retries: int = 3) -> Tuple[Optional[float], Optional[float], bool]:
     """
     Géocode une adresse avec retry intelligent et gestion d'erreurs améliorée
+    
+    Args:
+        address (str): L'adresse à géocoder
+        max_retries (int): Nombre maximum de tentatives
+        
+    Returns:
+        Tuple[Optional[float], Optional[float], bool]: (latitude, longitude, success)
     """
     geolocator = Nominatim(user_agent="delivery_route_optimizer_v2", timeout=20)
     
@@ -47,17 +62,24 @@ def geocode_address(address: str, max_retries: int = 3) -> Tuple[Optional[float]
             
             location = geolocator.geocode(address, timeout=15)
             if location:
+                logger.info(f"Geocoding successful for: {address[:50]}...")
                 return (location.latitude, location.longitude, True)
             else:
+                logger.warning(f"No location found for: {address[:50]}...")
                 return (None, None, False)
                 
-        except (GeocoderTimedOut, GeocoderServiceError) as e:
-            logger.warning(f"Geocoding error for: {address[:50]}... (attempt {attempt + 1}/{max_retries})")
+        except GeocoderTimedOut:
+            logger.warning(f"Geocoding timeout for: {address[:50]}... (attempt {attempt + 1}/{max_retries})")
+            if attempt == max_retries - 1:
+                return (None, None, False)
+            
+        except GeocoderServiceError as e:
+            logger.error(f"Geocoding service error for: {address[:50]}... - {str(e)}")
             if attempt == max_retries - 1:
                 return (None, None, False)
             
         except Exception as e:
-            logger.error(f"Unexpected geocoding error: {str(e)}")
+            logger.error(f"Unexpected geocoding error for: {address[:50]}... - {str(e)}")
             if attempt == max_retries - 1:
                 return (None, None, False)
     
@@ -66,6 +88,12 @@ def geocode_address(address: str, max_retries: int = 3) -> Tuple[Optional[float]
 def find_center_city_point(df_points: pd.DataFrame) -> int:
     """
     Trouve le point central de la ville (zone avec la plus forte densité de livraisons)
+    
+    Args:
+        df_points (pd.DataFrame): DataFrame avec les coordonnées des points
+        
+    Returns:
+        int: Index du point central
     """
     if len(df_points) < 3:
         return df_points.iloc[0].name
@@ -104,6 +132,13 @@ def find_center_city_point(df_points: pd.DataFrame) -> int:
 def filter_addresses_by_proximity(df_points: pd.DataFrame, max_radius_km: float = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Filtre les adresses pour garder seulement celles dans un secteur cohérent
+    
+    Args:
+        df_points (pd.DataFrame): DataFrame avec les coordonnées des points
+        max_radius_km (float): Rayon maximum en kilomètres
+        
+    Returns:
+        Tuple[pd.DataFrame, pd.DataFrame]: (adresses dans le secteur, adresses hors secteur)
     """
     if len(df_points) < 3:
         return df_points, pd.DataFrame()
@@ -166,6 +201,12 @@ def filter_addresses_by_proximity(df_points: pd.DataFrame, max_radius_km: float 
 def optimize_delivery_route_from_center(df_points: pd.DataFrame) -> List[int]:
     """
     Optimisation de tournée qui commence par le centre-ville avec algorithme amélioré
+    
+    Args:
+        df_points (pd.DataFrame): DataFrame avec les coordonnées des points
+        
+    Returns:
+        List[int]: Liste des indices dans l'ordre optimal
     """
     if len(df_points) <= 1:
         return df_points.index.tolist()
@@ -180,6 +221,9 @@ def optimize_delivery_route_from_center(df_points: pd.DataFrame) -> List[int]:
         # Étape 3: Optimisation locale avec 2-opt amélioré
         route_order = improve_route_2opt(df_points, route_order)
         
+        # Étape 4: Optimisation finale avec heuristique du plus proche voisin
+        route_order = refine_route_nearest_neighbor(df_points, route_order)
+        
         logger.info(f"Route optimization completed: {len(route_order)} points")
         return route_order
         
@@ -187,7 +231,7 @@ def optimize_delivery_route_from_center(df_points: pd.DataFrame) -> List[int]:
         logger.error(f"Error in optimize_delivery_route_from_center: {str(e)}")
         return df_points.index.tolist()
 
-def create_smart_route_from_center(df_points: pd.DataFrame, start_idx: int) -> List[int]:
+def create_smart_route_from_center(df_points, start_idx):
     """
     Crée un itinéraire intelligent qui part du centre et suit une logique géographique
     """
@@ -251,6 +295,72 @@ def create_smart_route_from_center(df_points: pd.DataFrame, start_idx: int) -> L
     
     return route
 
+def refine_route_nearest_neighbor(df_points: pd.DataFrame, route: List[int]) -> List[int]:
+    """
+    Affine la route avec une heuristique du plus proche voisin pour les segments problématiques
+    
+    Args:
+        df_points (pd.DataFrame): DataFrame avec les coordonnées des points
+        route (List[int]): Route actuelle
+        
+    Returns:
+        List[int]: Route affinée
+    """
+    if len(route) <= 3:
+        return route
+    
+    def calculate_segment_distance(idx1: int, idx2: int) -> float:
+        coord1 = (df_points.at[idx1, 'lat'], df_points.at[idx1, 'lon'])
+        coord2 = (df_points.at[idx2, 'lat'], df_points.at[idx2, 'lon'])
+        return geodesic(coord1, coord2).kilometers
+    
+    # Identifier les segments les plus longs (potentiellement problématiques)
+    segment_distances = []
+    for i in range(len(route) - 1):
+        distance = calculate_segment_distance(route[i], route[i + 1])
+        segment_distances.append((i, distance))
+    
+    # Trier par distance décroissante
+    segment_distances.sort(key=lambda x: x[1], reverse=True)
+    
+    # Optimiser les 20% des segments les plus longs
+    num_segments_to_optimize = max(1, len(segment_distances) // 5)
+    
+    for i in range(num_segments_to_optimize):
+        segment_idx = segment_distances[i][0]
+        if segment_idx < len(route) - 1:
+            # Essayer de trouver un meilleur point intermédiaire
+            current_point = route[segment_idx]
+            next_point = route[segment_idx + 1]
+            
+            # Chercher dans les points environnants
+            best_improvement = 0
+            best_point = None
+            
+            for j in range(max(0, segment_idx - 2), min(len(route), segment_idx + 4)):
+                if j != segment_idx and j != segment_idx + 1:
+                    test_point = route[j]
+                    
+                    # Calculer l'amélioration potentielle
+                    original_distance = calculate_segment_distance(current_point, next_point)
+                    new_distance = (calculate_segment_distance(current_point, test_point) + 
+                                  calculate_segment_distance(test_point, next_point))
+                    
+                    improvement = original_distance - new_distance
+                    if improvement > best_improvement:
+                        best_improvement = improvement
+                        best_point = test_point
+            
+            # Appliquer l'amélioration si elle est significative
+            if best_improvement > 0.5:  # Amélioration d'au moins 500m
+                # Réorganiser la route
+                new_route = route.copy()
+                point_idx = new_route.index(best_point)
+                new_route.pop(point_idx)
+                new_route.insert(segment_idx + 1, best_point)
+                route = new_route
+    
+    return route
 def improve_route_2opt(df_points: pd.DataFrame, route: List[int]) -> List[int]:
     """Amélioration de la route avec l'algorithme 2-opt amélioré"""
     if len(route) < 4:
@@ -300,7 +410,7 @@ def improve_route_2opt(df_points: pd.DataFrame, route: List[int]) -> List[int]:
     logger.info(f"2-opt optimization completed in {iterations} iterations")
     return best_route
 
-def calculate_route_stats(df_route: pd.DataFrame) -> Tuple[float, float, float]:
+def calculate_route_stats(df_route):
     """Calcul des statistiques de la tournée"""
     if len(df_route) < 2:
         return 0, 0, 0
@@ -324,6 +434,12 @@ def calculate_route_stats(df_route: pd.DataFrame) -> Tuple[float, float, float]:
 def detect_columns_smart(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Détection intelligente des colonnes adresse, code postal et ville avec algorithme amélioré
+    
+    Args:
+        df (pd.DataFrame): DataFrame à analyser
+        
+    Returns:
+        Tuple[Optional[str], Optional[str], Optional[str]]: (colonne_adresse, colonne_postal, colonne_ville)
     """
     columns = df.columns.tolist()
     
@@ -362,6 +478,21 @@ def detect_columns_smart(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]
         
         return score
     
+    # Analyse des données pour confirmer les types
+    def analyze_column_content(col_name: str) -> dict:
+        """Analyse le contenu d'une colonne pour déterminer son type"""
+        try:
+            sample = df[col_name].dropna().head(20).astype(str)
+            analysis = {
+                'avg_length': sample.str.len().mean(),
+                'has_numbers': sample.str.contains(r'\d').sum(),
+                'has_spaces': sample.str.contains(' ').sum(),
+                'numeric_ratio': sample.str.isdigit().sum() / len(sample)
+            }
+            return analysis
+        except:
+            return {'avg_length': 0, 'has_numbers': 0, 'has_spaces': 0, 'numeric_ratio': 0}
+    
     # Scoring des colonnes
     address_scores = []
     postal_scores = []
@@ -372,6 +503,17 @@ def detect_columns_smart(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]
         addr_score = score_column(col, address_keywords)
         postal_score = score_column(col, postal_keywords)
         city_score = score_column(col, city_keywords)
+        
+        # Analyse du contenu
+        content_analysis = analyze_column_content(col)
+        
+        # Ajustement des scores basé sur le contenu
+        if content_analysis['avg_length'] > 20:  # Probablement une adresse
+            addr_score += 1
+        if content_analysis['numeric_ratio'] > 0.8:  # Probablement un code postal
+            postal_score += 2
+        if 5 <= content_analysis['avg_length'] <= 30 and content_analysis['has_spaces'] / len(df[col].dropna().head(20)) > 0.3:
+            city_score += 1
         
         address_scores.append((col, addr_score))
         postal_scores.append((col, postal_score))
@@ -409,6 +551,13 @@ def detect_columns_smart(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]
 def validate_input_data(df: pd.DataFrame, address_col: str, postal_col: str, city_col: str) -> Tuple[bool, str]:
     """
     Valide les données d'entrée
+    
+    Args:
+        df (pd.DataFrame): DataFrame à valider
+        address_col, postal_col, city_col (str): Noms des colonnes
+        
+    Returns:
+        Tuple[bool, str]: (is_valid, error_message)
     """
     try:
         # Vérifier que les colonnes existent
@@ -442,6 +591,12 @@ def validate_input_data(df: pd.DataFrame, address_col: str, postal_col: str, cit
 def calculate_route_quality_metrics(df_route: pd.DataFrame) -> dict:
     """
     Calcule des métriques de qualité pour la route
+    
+    Args:
+        df_route (pd.DataFrame): DataFrame de la route optimisée
+        
+    Returns:
+        dict: Métriques de qualité
     """
     if len(df_route) < 2:
         return {}
@@ -501,6 +656,7 @@ def calculate_route_quality_metrics(df_route: pd.DataFrame) -> dict:
         logger.error(f"Error calculating route quality metrics: {str(e)}")
         return {}
 
+# Interface utilisateur
 def main():
     """Main function containing the Streamlit interface"""
     st.header("📁 Chargement du fichier")
@@ -531,92 +687,97 @@ def main():
     st.subheader("📊 Aperçu des données")
     st.dataframe(df.head(10), use_container_width=True)
 
-    # Détection automatique intelligente
-    address_col, postal_col, city_col = detect_columns_smart(df)
+# Détection automatique intelligente
+address_col, postal_col, city_col = detect_columns_smart(df)
 
-    # Si détection automatique échoue, permettre sélection manuelle
+# Si détection automatique échoue, permettre sélection manuelle
+if not all([address_col, postal_col, city_col]):
+    st.warning("⚠️ Détection automatique des colonnes échouée. Sélection manuelle requise.")
+    
+    col1, col2, col3 = st.columns(3)
+    columns = df.columns.tolist()
+    
+    with col1:
+        address_col = st.selectbox("📍 Colonne Adresse", columns, key="manual_address")
+    with col2:
+        postal_col = st.selectbox("📮 Colonne Code Postal", columns, key="manual_postal")
+    with col3:
+        city_col = st.selectbox("🏙️ Colonne Ville", columns, key="manual_city")
+    
     if not all([address_col, postal_col, city_col]):
-        st.warning("⚠️ Détection automatique des colonnes échouée. Sélection manuelle requise.")
-        
-        col1, col2, col3 = st.columns(3)
-        columns = df.columns.tolist()
-        
-        with col1:
-            address_col = st.selectbox("📍 Colonne Adresse", columns, key="manual_address")
-        with col2:
-            postal_col = st.selectbox("📮 Colonne Code Postal", columns, key="manual_postal")
-        with col3:
-            city_col = st.selectbox("🏙️ Colonne Ville", columns, key="manual_city")
-        
-        if not all([address_col, postal_col, city_col]):
-            st.error("❌ Veuillez sélectionner toutes les colonnes requises")
-            st.stop()
-        
-        st.info(f"📍 Colonnes sélectionnées : {address_col}, {postal_col}, {city_col}")
-    else:
-        st.success(f"✅ Colonnes détectées automatiquement : {address_col}, {postal_col}, {city_col}")
-
+        st.error("❌ Veuillez sélectionner toutes les colonnes requises")
+        st.stop()
+    
+    st.info(f"📍 Colonnes sélectionnées : {address_col}, {postal_col}, {city_col}")
+    
     # Validation des données
     is_valid, validation_message = validate_input_data(df, address_col, postal_col, city_col)
     if not is_valid:
         st.error(f"❌ Erreur de validation : {validation_message}")
         st.stop()
-
-    # Paramètres de filtrage
-    st.markdown("---")
-    st.subheader("⚙️ Paramètres de la tournée")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        max_radius = st.slider(
-            "🎯 Rayon maximum de livraison (km)",
-            min_value=5,
-            max_value=25,
-            value=15,
-            help="Distance maximale depuis le centre-ville"
-        )
-    with col2:
-        max_addresses = st.slider(
-            "📦 Nombre maximum d'adresses",
-            min_value=10,
-            max_value=200,
-            value=100,
-            help="Limite pour éviter les quotas API"
-        )
-
-    # Validation et nettoyage des données
-    st.markdown("---")
-    st.subheader("🧹 Nettoyage des données")
-
-    # Nettoyage des données
-    df_clean = df.dropna(subset=[address_col, postal_col, city_col]).copy()
-
-    # Nettoyage des codes postaux
-    df_clean[postal_col] = df_clean[postal_col].astype(str).str.extract(r'(\d+)')[0]
-    df_clean = df_clean.dropna(subset=[postal_col])
-
-    # Suppression des lignes avec des valeurs vides
-    df_clean = df_clean[df_clean[address_col].astype(str).str.strip() != '']
-    df_clean = df_clean[df_clean[city_col].astype(str).str.strip() != '']
-    df_clean = df_clean[df_clean[postal_col].astype(str).str.strip() != '']
-
-    # Limitation
-    if len(df_clean) > max_addresses:
-        st.warning(f"⚠️ Limitation à {max_addresses} adresses pour éviter les quotas API")
-        df_clean = df_clean.head(max_addresses)
-
-    st.info(f"📊 Données nettoyées : {len(df_clean)} adresses valides")
-
-    if len(df_clean) == 0:
-        st.error("❌ Aucune donnée valide après nettoyage")
+    else:
+        st.success(f"✅ Validation réussie : {validation_message}")
+else:
+    st.success(f"✅ Colonnes détectées automatiquement : {address_col}, {postal_col}, {city_col}")
+    
+    # Validation des données détectées automatiquement
+    is_valid, validation_message = validate_input_data(df, address_col, postal_col, city_col)
+    if not is_valid:
+        st.error(f"❌ Erreur de validation : {validation_message}")
         st.stop()
 
-    # Bouton de traitement
-    if st.button("🚀 Organiser la tournée intelligente", type="primary", use_container_width=True):
-        process_route_optimization(df_clean, address_col, postal_col, city_col, max_radius)
+# Paramètres de filtrage
+st.markdown("---")
+st.subheader("⚙️ Paramètres de la tournée")
 
-def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_col: str, city_col: str, max_radius: float):
-    """Process the route optimization"""
+col1, col2 = st.columns(2)
+with col1:
+    max_radius = st.slider(
+        "🎯 Rayon maximum de livraison (km)",
+        min_value=5,
+        max_value=25,
+        value=15,
+        help="Distance maximale depuis le centre-ville"
+    )
+with col2:
+    max_addresses = st.slider(
+        "📦 Nombre maximum d'adresses",
+        min_value=10,
+        max_value=200,
+        value=100,
+        help="Limite pour éviter les quotas API"
+    )
+
+# Validation et nettoyage des données
+st.markdown("---")
+st.subheader("🧹 Nettoyage des données")
+
+# Nettoyage des données
+df_clean = df.dropna(subset=[address_col, postal_col, city_col]).copy()
+
+# Nettoyage des codes postaux
+df_clean[postal_col] = df_clean[postal_col].astype(str).str.extract('(\d+)')[0]
+df_clean = df_clean.dropna(subset=[postal_col])
+
+# Suppression des lignes avec des valeurs vides
+df_clean = df_clean[df_clean[address_col].astype(str).str.strip() != '']
+df_clean = df_clean[df_clean[city_col].astype(str).str.strip() != '']
+df_clean = df_clean[df_clean[postal_col].astype(str).str.strip() != '']
+
+# Limitation
+if len(df_clean) > max_addresses:
+    st.warning(f"⚠️ Limitation à {max_addresses} adresses pour éviter les quotas API")
+    df_clean = df_clean.head(max_addresses)
+
+st.info(f"📊 Données nettoyées : {len(df_clean)} adresses valides")
+
+if len(df_clean) == 0:
+    st.error("❌ Aucune donnée valide après nettoyage")
+    st.stop()
+
+# Bouton de traitement
+if st.button("🚀 Organiser la tournée intelligente", type="primary", use_container_width=True):
+    
     # Construction des adresses complètes
     df_clean['adresse_complete'] = (
         df_clean[address_col].astype(str) + ", " + 
@@ -624,27 +785,50 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
         df_clean[city_col].astype(str) + ", France"
     )
     
-    # Géocodage avec barre de progression
+    # Géocodage avec barre de progression améliorée
     st.markdown("---")
     st.subheader("🌍 Géocodage en cours...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
+    success_counter = st.empty()
     
     coordinates = []
     geocoding_success = []
     total_addresses = len(df_clean)
+    success_count = 0
+    
+    # Estimation du temps
+    estimated_time = total_addresses * 1.5  # 1.5 secondes par adresse en moyenne
+    start_time = time.time()
     
     for i, address in enumerate(df_clean['adresse_complete']):
         progress = (i + 1) / total_addresses
         progress_bar.progress(progress)
-        status_text.text(f"Géocodage : {i+1}/{total_addresses} - {address[:50]}...")
+        
+        # Calcul du temps restant
+        if i > 0:
+            elapsed_time = time.time() - start_time
+            avg_time_per_address = elapsed_time / i
+            remaining_time = avg_time_per_address * (total_addresses - i)
+            time_str = f" - Temps restant: {remaining_time:.0f}s"
+        else:
+            time_str = ""
+        
+        status_text.text(f"Géocodage : {i+1}/{total_addresses}{time_str}")
         
         lat, lon, success = geocode_address(address)
         coordinates.append((lat, lon))
         geocoding_success.append(success)
         
-        time.sleep(1.2)  # Délai pour éviter le rate limiting
+        if success:
+            success_count += 1
+        
+        success_counter.text(f"✅ Succès: {success_count}/{i+1} ({success_count/(i+1)*100:.1f}%)")
+        
+        # Délai adaptatif pour éviter le rate limiting
+        if i < total_addresses - 1:  # Pas de délai pour la dernière adresse
+            time.sleep(1.2)  # Délai légèrement réduit
     
     # Ajout des coordonnées
     df_clean[['lat', 'lon']] = pd.DataFrame(coordinates)
@@ -737,6 +921,19 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
             quality_score = route_quality.get('quality_score', 0)
             st.metric("⭐ Score qualité", f"{quality_score:.2f}")
     
+    # Identification du point de départ
+    center_idx = find_center_city_point(df_optimized)
+    st.info(f"🎯 **Point de départ** : {df_optimized.iloc[0][address_col]} (Centre-ville détecté)")
+    
+    # Alertes de qualité
+    if route_quality:
+        if route_quality.get('max_distance', 0) > 15:
+            st.warning(f"⚠️ Distance maximale entre étapes élevée: {route_quality['max_distance']:.1f} km")
+        if route_quality.get('efficiency', 1) < 0.3:
+            st.warning("⚠️ Efficacité de la route faible - considérez diviser en plusieurs tournées")
+        if route_quality.get('quality_score', 0) > 0.7:
+            st.success("✅ Excellente qualité de route optimisée!")
+    
     # Tableau optimisé
     st.subheader("🗂️ Itinéraire de livraison optimisé")
     
@@ -746,6 +943,8 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
     
     # Calcul des distances entre étapes
     distances_etapes = []
+    temps_cumule = 0
+    
     for i in range(len(df_display)):
         if i == 0:
             distances_etapes.append("🏁 Départ")
@@ -753,6 +952,7 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
             coord1 = (df_display.iloc[i-1]['lat'], df_display.iloc[i-1]['lon'])
             coord2 = (df_display.iloc[i]['lat'], df_display.iloc[i]['lon'])
             dist = geodesic(coord1, coord2).kilometers
+            temps_cumule += dist * 3 + 5  # 3 min/km + 5 min arrêt
             distances_etapes.append(f"{dist:.1f} km")
     
     df_display['Distance'] = distances_etapes
@@ -766,29 +966,124 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
         hide_index=True
     )
     
-    # Export Excel
+    # Export Excel amélioré
     st.markdown("---")
     st.subheader("💾 Téléchargement")
     
-    # Préparation de l'export
+    # Préparation de l'export avec métadonnées
     export_data = df_display.copy()
+    
+    # Ajout des coordonnées pour GPS
     export_data['Latitude'] = df_optimized['lat']
     export_data['Longitude'] = df_optimized['lon']
     
-    # Fichier Excel
+    # Ajout des informations de temps
+    temps_cumule = []
+    for i in range(len(df_display)):
+        if i == 0:
+            temps_cumule.append(0)
+        else:
+            coord1 = (df_display.iloc[i-1]['lat'], df_display.iloc[i-1]['lon'])
+            coord2 = (df_display.iloc[i]['lat'], df_display.iloc[i]['lon'])
+            dist = geodesic(coord1, coord2).kilometers
+            temps_etape = dist * 3 + 5  # 3 min/km + 5 min arrêt
+            temps_cumule.append(temps_cumule[-1] + temps_etape)
+    
+    export_data['Temps_cumule_min'] = temps_cumule
+    
+    # Création du fichier Excel avec formatage
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Feuille principale - Tournée optimisée
         export_data.to_excel(writer, index=False, sheet_name='Tournée_optimisée')
+        
+        # Feuille des statistiques
+        stats_data = {
+            'Métrique': [
+                'Nombre total d\'adresses',
+                'Adresses géocodées',
+                'Adresses dans le secteur',
+                'Adresses hors secteur',
+                'Adresses non géocodées',
+                'Distance totale (km)',
+                'Temps estimé (min)',
+                'Distance moyenne par étape (km)',
+                'Efficacité du géocodage (%)',
+                'Rayon du secteur utilisé (km)'
+            ],
+            'Valeur': [
+                len(df_clean),
+                len(df_geocoded),
+                len(df_sector),
+                len(df_out_sector),
+                len(df_failed),
+                f"{total_distance:.1f}",
+                f"{estimated_time:.0f}",
+                f"{avg_distance:.1f}",
+                f"{len(df_geocoded)/len(df_clean)*100:.1f}",
+                f"{max_radius:.1f}"
+            ]
+        }
+        pd.DataFrame(stats_data).to_excel(writer, index=False, sheet_name='Statistiques')
+        
+        # Feuille des échecs de géocodage
         if len(df_failed) > 0:
-            df_failed.to_excel(writer, index=False, sheet_name='Échecs_géocodage')
+            df_failed_export = df_failed.copy()
+            df_failed_export['Raison'] = 'Géocodage échoué'
+            df_failed_export.to_excel(writer, index=False, sheet_name='Échecs_géocodage')
+        
+        # Feuille des adresses hors secteur
         if len(df_out_sector) > 0:
-            df_out_sector.to_excel(writer, index=False, sheet_name='Hors_secteur')
+            df_out_sector_export = df_out_sector.copy()
+            # Calculer la distance du centre pour chaque adresse hors secteur
+            center_idx = find_center_city_point(df_sector)
+            if center_idx in df_sector.index:
+                center_coords = (df_sector.at[center_idx, 'lat'], df_sector.at[center_idx, 'lon'])
+                distances_center = []
+                for _, row in df_out_sector.iterrows():
+                    point_coords = (row['lat'], row['lon'])
+                    dist = geodesic(center_coords, point_coords).kilometers
+                    distances_center.append(f"{dist:.1f}")
+                df_out_sector_export['Distance_du_centre_km'] = distances_center
+            
+            df_out_sector_export.to_excel(writer, index=False, sheet_name='Hors_secteur')
+        
+        # Formatage des feuilles
+        try:
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+            
+            # Formatage de la feuille principale
+            ws_main = writer.sheets['Tournée_optimisée']
+            
+            # En-têtes en gras
+            for col in range(1, ws_main.max_column + 1):
+                ws_main.cell(row=1, column=col).font = Font(bold=True)
+                ws_main.cell(row=1, column=col).fill = PatternFill(start_color='CCCCCC', end_color='CCCCCC', fill_type='solid')
+            
+            # Ajustement automatique des largeurs de colonnes
+            for col in range(1, ws_main.max_column + 1):
+                column_letter = get_column_letter(col)
+                ws_main.column_dimensions[column_letter].width = 15
+            
+            # Formatage de la feuille des statistiques
+            if 'Statistiques' in writer.sheets:
+                ws_stats = writer.sheets['Statistiques']
+                for col in range(1, ws_stats.max_column + 1):
+                    ws_stats.cell(row=1, column=col).font = Font(bold=True)
+                    ws_stats.cell(row=1, column=col).fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
+                    column_letter = get_column_letter(col)
+                    ws_stats.column_dimensions[column_letter].width = 25
+                    
+        except ImportError:
+            # Si openpyxl.styles n'est pas disponible, continuer sans formatage
+            pass
     
     output.seek(0)
     
-    # Nom du fichier
+    # Nom du fichier avec informations
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"tournee_optimisee_{timestamp}.xlsx"
+    filename = f"tournee_optimisee_{len(df_optimized)}adresses_{timestamp}.xlsx"
     
     st.download_button(
         label="📥 Télécharger la tournée optimisée",
@@ -812,9 +1107,6 @@ def process_route_optimization(df_clean: pd.DataFrame, address_col: str, postal_
     ✅ **Ordre logique** : Parcours géographiquement cohérent
     ✅ **Temps réaliste** : Inclut temps de conduite + temps d'arrêt
     """)
-
-if __name__ == "__main__":
-    main()
 
 # Footer
 st.markdown("---")
