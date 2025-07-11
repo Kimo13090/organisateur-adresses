@@ -112,43 +112,45 @@ st.dataframe(
     use_container_width=True
 )
 
-# Construction de la route segment par segment (OSRM Route API)
-@st.cache_data
-# Construit une liste de points lat, lon suivant la route réelle
-def build_route(pts):
-    route = []
-    for start, end in zip(pts[:-1], pts[1:]):
-        lon1, lat1 = start[1], start[0]
-        lon2, lat2 = end[1], end[0]
-        url = (
-            f"http://router.project-osrm.org/route/v1/driving/"
-            f"{lon1},{lat1};{lon2},{lat2}?overview=full&geometries=geojson"
-        )
-        try:
-            res = requests.get(url, timeout=10)
-            res.raise_for_status()
-            coords = res.json()["routes"][0]["geometry"]["coordinates"]
-            route.extend([(lat, lon) for lon, lat in coords])
-        except:
-            # Si échec, tracer droit
-            route.append(start)
-            route.append(end)
-    return route
+# Récupération de l'itinéraire et instructions via OSRM Route API
+with st.spinner("Calcul de la route et des instructions..."):
+    waypoints = ";".join(
+        f"{lon},{lat}" for lat, lon in zip(df_opt["Latitude"], df_opt["Longitude"])
+    )
+    route_url = (
+        f"http://router.project-osrm.org/route/v1/driving/{waypoints}"
+        "?overview=full&geometries=geojson&steps=true"
+    )
+    try:
+        response = requests.get(route_url, timeout=20)
+        response.raise_for_status()
+        route_data = response.json()["routes"][0]
+        coords_geo = route_data["geometry"]["coordinates"]
+        route_pts = [(lat, lon) for lon, lat in coords_geo]
+        # Extraire les instructions
+        legs = route_data.get("legs", [])
+        instructions = []
+        for leg in legs:
+            for step in leg.get("steps", []):
+                m = step["maneuver"]
+                instr = m.get("type", "").capitalize()
+                mod = m.get("modifier", "")
+                name = step.get("name", "")
+                dist = step.get("distance", 0)
+                full = f"{instr} {mod} sur {name} ({dist:.0f} m)"
+                instructions.append(full)
+    except Exception:
+        st.warning("Impossible de récupérer les instructions via OSRM. Affichage sans instructions.")
+        route_pts = list(zip(df_opt["Latitude"], df_opt["Longitude"]))
+        instructions = []
 
-coords_list = list(zip(df_opt["Latitude"], df_opt["Longitude"]))
-route_pts = build_route(coords_list)
-
-# Création de la carte interactive avec marqueurs numérotés
-m = folium.Map(location=coords_list[0], zoom_start=12)
+# Affichage de la carte interactive avec tracé routier
+m = folium.Map(location=route_pts[0], zoom_start=12)
 line = folium.PolyLine(route_pts, color="blue", weight=4, opacity=0.7)
 m.add_child(line)
-# Flèches le long de la route
 PolyLineTextPath(line, '▶', repeat=True, offset=10, attributes={'fill':'blue','font-size':'12'})
-
-# Ajout des marqueurs
-for idx, (lat, lon) in enumerate(coords_list):
-    # Couleurs : début vert, fin rouge, intermédiaire bleu
-    color = 'green' if idx == 0 else ('red' if idx == len(coords_list)-1 else 'blue')
+for idx, (lat, lon) in enumerate(zip(df_opt["Latitude"], df_opt["Longitude"])):
+    color = 'green' if idx == 0 else ('red' if idx == len(df_opt)-1 else 'blue')
     html = f"<div style='background:{color};color:white;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-weight:bold'>{idx+1}</div>"
     folium.Marker(
         location=(lat, lon),
@@ -158,7 +160,24 @@ for idx, (lat, lon) in enumerate(coords_list):
 st.subheader("Itinéraire interactif (voiture)")
 st_folium(m, width=800, height=600)
 
+# Afficher les instructions si disponibles
+if instructions:
+    st.subheader("Instructions de conduite")
+    for i, inst in enumerate(instructions, 1):
+        st.markdown(f"{i}. {inst}")
+
 # Export du fichier Excel
+out = io.BytesIO()
+with pd.ExcelWriter(out, engine="openpyxl") as writer:
+    df_opt.to_excel(writer, index=False, sheet_name="Repérage")
+out.seek(0)
+
+st.download_button(
+    "Télécharger la tournée organisée (.xlsx)",
+    data=out,
+    file_name="tournee_organisee.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 output = io.BytesIO()
 with pd.ExcelWriter(output, engine="openpyxl") as writer:
     df_opt.to_excel(writer, index=False, sheet_name="Repérage")
