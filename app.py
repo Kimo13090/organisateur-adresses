@@ -9,8 +9,12 @@ import time
 import numpy as np
 from datetime import datetime
 import math
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
-# Configuration de la page avec thème personnalisé
+# Configuration de la page
 st.set_page_config(
     page_title="Optimisateur de Tournées Logistiques",
     page_icon="🚛",
@@ -18,31 +22,28 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Initialisation du session state
-if 'processing_done' not in st.session_state:
-    st.session_state.processing_done = False
-if 'df_optimized' not in st.session_state:
-    st.session_state.df_optimized = None
-if 'df_out_sector' not in st.session_state:
-    st.session_state.df_out_sector = None
-if 'df_failed' not in st.session_state:
-    st.session_state.df_failed = None
-if 'total_distance' not in st.session_state:
-    st.session_state.total_distance = 0
-if 'excel_data' not in st.session_state:
-    st.session_state.excel_data = None
-if 'map_data' not in st.session_state:
-    st.session_state.map_data = None
-
-# CSS personnalisé pour améliorer le design
-st.markdown("""
-<style>
-    /* Thème général */
-    .main {
-        background-color: #f5f7fa;
+# Initialisation du session state avec valeurs par défaut
+def init_session_state():
+    defaults = {
+        'geocode_cache': {},
+        'current_file_hash': None,
+        'processing_status': 'idle',  # idle, processing, completed
+        'results': {},
+        'error_message': None
     }
     
-    /* Titre principal */
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_session_state()
+
+# CSS optimisé
+st.markdown("""
+<style>
+    /* Performance: utiliser transform au lieu de box-shadow pour les animations */
+    .main { background-color: #f5f7fa; }
+    
     .main-header {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         padding: 2rem;
@@ -50,7 +51,7 @@ st.markdown("""
         text-align: center;
         color: white;
         margin-bottom: 2rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        will-change: transform;
     }
     
     .main-header h1 {
@@ -59,22 +60,14 @@ st.markdown("""
         font-weight: bold;
     }
     
-    .main-header p {
-        margin: 0.5rem 0 0 0;
-        font-size: 1.1rem;
-        opacity: 0.9;
-    }
-    
-    /* Cartes métriques */
     div[data-testid="metric-container"] {
         background-color: white;
         border: 1px solid #e0e0e0;
         padding: 1rem;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
     }
     
-    /* Boutons personnalisés */
     .stButton > button {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -82,36 +75,29 @@ st.markdown("""
         padding: 0.75rem 2rem;
         font-weight: 600;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        transition: all 0.3s ease;
+        transition: transform 0.2s ease;
+        will-change: transform;
     }
     
     .stButton > button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
     }
     
-    /* Conteneur de résultats fixe */
-    .results-container {
-        background: white;
-        padding: 2rem;
-        border-radius: 10px;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-        margin: 1rem 0;
-    }
-    
-    /* Section de téléchargement mise en avant */
-    .download-section {
-        background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+    .download-ready {
+        background: #48bb78;
         color: white;
-        padding: 2rem;
+        padding: 1.5rem;
         border-radius: 10px;
         text-align: center;
-        margin: 2rem 0;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        margin: 1rem 0;
+        animation: slideIn 0.3s ease-out;
     }
     
-    /* Footer */
+    @keyframes slideIn {
+        from { opacity: 0; transform: translateY(-20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
     .footer {
         background: #2d3748;
         color: white;
@@ -121,19 +107,23 @@ st.markdown("""
         margin-top: 3rem;
     }
     
-    /* Animation de succès */
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(20px); }
-        to { opacity: 1; transform: translateY(0); }
+    /* Désactiver les animations inutiles */
+    * {
+        animation-duration: 0.3s !important;
+        transition-duration: 0.2s !important;
     }
     
-    .success-message {
-        animation: fadeIn 0.5s ease-out;
+    .tour-section {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        border-left: 4px solid #667eea;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# En-tête personnalisé
+# En-tête
 st.markdown("""
 <div class="main-header">
     <h1>🚛 Optimisateur de Tournées Logistiques</h1>
@@ -141,499 +131,662 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-@st.cache_data
-def geocode_address(address, max_retries=3):
-    """Géocode une adresse avec retry et gestion d'erreurs"""
-    geolocator = Nominatim(user_agent="logistics_optimizer_v2")
-    
-    for attempt in range(max_retries):
-        try:
-            location = geolocator.geocode(address, timeout=15)
-            if location:
-                return (location.latitude, location.longitude, True)
-            else:
-                return (None, None, False)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return (None, None, False)
-            time.sleep(2)
-    
-    return (None, None, False)
+# Cache pour le géocodage avec persistance
+@st.cache_data(persist=True, ttl=86400)  # Cache pour 24h
+def get_cached_geocoding():
+    return {}
 
-def find_outliers_using_mad(df_points):
-    """Détecte automatiquement les adresses hors secteur"""
-    if len(df_points) < 5:
+def save_to_cache(address, result):
+    cache = get_cached_geocoding()
+    cache[address] = result
+    return cache
+
+# Fonction de géocodage optimisée
+def geocode_address_optimized(address, geolocator=None):
+    """Géocode avec cache persistant"""
+    # Vérifier le cache global
+    cache = get_cached_geocoding()
+    if address in cache:
+        return cache[address]
+    
+    # Vérifier le cache de session
+    if address in st.session_state.geocode_cache:
+        return st.session_state.geocode_cache[address]
+    
+    # Géocoder si pas en cache
+    if geolocator is None:
+        geolocator = Nominatim(user_agent="logistics_optimizer_pro", timeout=10)
+    
+    try:
+        location = geolocator.geocode(address, exactly_one=True)
+        if location:
+            result = (location.latitude, location.longitude, True)
+        else:
+            result = (None, None, False)
+    except Exception:
+        result = (None, None, False)
+    
+    # Sauvegarder dans les deux caches
+    st.session_state.geocode_cache[address] = result
+    save_to_cache(address, result)
+    
+    return result
+
+# Géocodage par batch avec threading
+def batch_geocode_parallel(addresses, progress_bar=None, status_text=None):
+    """Géocodage parallèle pour améliorer les performances"""
+    results = [None] * len(addresses)
+    completed = 0
+    lock = threading.Lock()
+    
+    # Créer un geolocator par thread
+    def geocode_single(idx, address):
+        nonlocal completed
+        geolocator = Nominatim(user_agent=f"logistics_optimizer_thread_{idx}", timeout=10)
+        result = geocode_address_optimized(address, geolocator)
+        
+        with lock:
+            results[idx] = result
+            completed += 1
+            if progress_bar and status_text:
+                progress = completed / len(addresses)
+                progress_bar.progress(progress)
+                status_text.text(f"Géolocalisation : {completed}/{len(addresses)} adresses")
+        
+        # Pause seulement pour les nouvelles requêtes
+        if address not in st.session_state.geocode_cache:
+            time.sleep(1.0)  # Respecter les limites API
+        
+        return result
+    
+    # Utiliser ThreadPoolExecutor pour paralléliser
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = []
+        for idx, address in enumerate(addresses):
+            future = executor.submit(geocode_single, idx, address)
+            futures.append(future)
+        
+        # Attendre que tout soit terminé
+        for future in futures:
+            future.result()
+    
+    return results
+
+# Détection intelligente des colonnes
+def detect_columns_smart(df):
+    """Détection améliorée des colonnes"""
+    columns = df.columns.tolist()
+    column_lower = [col.lower() for col in columns]
+    
+    # Patterns de détection
+    patterns = {
+        'address': ['adresse', 'address', 'rue', 'street', 'voie', 'client', 'nom', 'lieu', 'livraison'],
+        'postal': ['postal', 'cp', 'code', 'zip', 'postcode', 'code_postal'],
+        'city': ['ville', 'city', 'commune', 'localite', 'locality', 'municipalite']
+    }
+    
+    detected = {}
+    
+    for col_type, keywords in patterns.items():
+        for i, col in enumerate(column_lower):
+            if any(keyword in col for keyword in keywords):
+                detected[col_type] = columns[i]
+                break
+    
+    return detected.get('address'), detected.get('postal'), detected.get('city')
+
+# Algorithme optimisé pour la détection des hors secteur
+def detect_outliers_advanced(df_points):
+    """Détection avancée des outliers avec clustering"""
+    if len(df_points) < 3:
         return df_points.index.tolist(), []
     
+    # Calculer le centre médian
     center_lat = df_points['lat'].median()
     center_lon = df_points['lon'].median()
-    center = (center_lat, center_lon)
     
+    # Calculer toutes les distances
     distances = []
     for idx, row in df_points.iterrows():
-        point = (row['lat'], row['lon'])
-        dist = geodesic(center, point).kilometers
-        distances.append(dist)
+        dist = geodesic((center_lat, center_lon), (row['lat'], row['lon'])).kilometers
+        distances.append((idx, dist))
     
-    df_points['distance_from_center'] = distances
+    # Trier par distance
+    distances.sort(key=lambda x: x[1])
     
-    median_distance = np.median(distances)
-    mad = np.median(np.abs(distances - median_distance))
-    threshold = median_distance + 2.5 * mad
-    threshold = max(threshold, 10.0)
+    # Utiliser une approche percentile pour identifier les outliers
+    if len(distances) > 10:
+        # 90e percentile comme seuil
+        threshold_idx = int(len(distances) * 0.9)
+        threshold_dist = distances[threshold_idx][1]
+        
+        # S'assurer d'un seuil minimum raisonnable
+        threshold_dist = max(threshold_dist, 15.0)
+    else:
+        # Pour peu de points, utiliser 2x la distance médiane
+        median_dist = distances[len(distances)//2][1]
+        threshold_dist = max(median_dist * 2, 10.0)
     
+    # Classification
     in_sector = []
     out_sector = []
     
-    for idx, dist in zip(df_points.index, distances):
-        if dist <= threshold:
+    for idx, dist in distances:
+        if dist <= threshold_dist:
             in_sector.append(idx)
         else:
             out_sector.append(idx)
     
+    # Ajouter la distance au dataframe
+    dist_dict = {idx: dist for idx, dist in distances}
+    df_points['distance_from_center'] = df_points.index.map(dist_dict)
+    
     return in_sector, out_sector
 
-def create_folium_map(df_route, df_out_sector=None):
-    """Crée une carte Folium interactive avec l'itinéraire"""
-    center_lat = df_route['lat'].mean()
-    center_lon = df_route['lon'].mean()
+# Division en tournées optimisée
+def create_multiple_tours(df_sector, max_per_tour=50):
+    """Création de tournées multiples avec clustering géographique"""
+    if len(df_sector) <= max_per_tour:
+        return [df_sector]
     
+    n_tours = math.ceil(len(df_sector) / max_per_tour)
+    
+    # K-means simplifié pour le clustering géographique
+    tours = []
+    points = df_sector[['lat', 'lon']].values
+    
+    # Initialiser les centres avec k-means++
+    centers = []
+    centers.append(points[np.random.randint(len(points))])
+    
+    for _ in range(1, n_tours):
+        distances = []
+        for point in points:
+            min_dist = min([np.sqrt(np.sum((point - center)**2)) for center in centers])
+            distances.append(min_dist)
+        
+        probabilities = np.array(distances) / sum(distances)
+        centers.append(points[np.random.choice(len(points), p=probabilities)])
+    
+    # Assigner chaque point au centre le plus proche
+    assignments = []
+    for point in points:
+        distances = [np.sqrt(np.sum((point - center)**2)) for center in centers]
+        assignments.append(np.argmin(distances))
+    
+    # Créer les tournées
+    for i in range(n_tours):
+        tour_indices = [idx for idx, assignment in enumerate(assignments) if assignment == i]
+        if tour_indices:
+            tour_df = df_sector.iloc[tour_indices]
+            tours.append(tour_df)
+    
+    return tours
+
+# Optimisation TSP améliorée
+def optimize_route_2opt(df_points):
+    """Algorithme 2-opt pour l'optimisation de route"""
+    if len(df_points) <= 2:
+        return df_points.index.tolist()
+    
+    # Matrice de distances pré-calculée
+    n = len(df_points)
+    dist_matrix = np.zeros((n, n))
+    points = df_points[['lat', 'lon']].values
+    
+    for i in range(n):
+        for j in range(i+1, n):
+            dist = geodesic(points[i], points[j]).kilometers
+            dist_matrix[i][j] = dist
+            dist_matrix[j][i] = dist
+    
+    # Tour initial avec nearest neighbor
+    unvisited = set(range(1, n))
+    tour = [0]
+    current = 0
+    
+    while unvisited:
+        nearest = min(unvisited, key=lambda x: dist_matrix[current][x])
+        tour.append(nearest)
+        unvisited.remove(nearest)
+        current = nearest
+    
+    # Amélioration 2-opt
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n-2):
+            for j in range(i+1, n):
+                if j - i == 1:
+                    continue
+                
+                # Calculer le gain
+                gain = (dist_matrix[tour[i-1]][tour[i]] + dist_matrix[tour[j-1]][tour[j]] -
+                       dist_matrix[tour[i-1]][tour[j-1]] - dist_matrix[tour[i]][tour[j]])
+                
+                if gain > 0:
+                    tour[i:j] = reversed(tour[i:j])
+                    improved = True
+                    break
+            if improved:
+                break
+    
+    # Convertir en indices du dataframe
+    return [df_points.index[i] for i in tour]
+
+# Création de carte optimisée
+def create_optimized_map(all_tours, df_out_sector=None):
+    """Création de carte avec performances optimisées"""
+    # Calculer le centre global
+    all_points = []
+    for tour in all_tours:
+        all_points.extend(tour[['lat', 'lon']].values.tolist())
+    
+    if not all_points:
+        return None
+    
+    center = np.mean(all_points, axis=0)
+    
+    # Créer la carte
     m = folium.Map(
-        location=[center_lat, center_lon],
+        location=center,
         zoom_start=12,
-        tiles='OpenStreetMap'
+        tiles='OpenStreetMap',
+        prefer_canvas=True  # Meilleure performance pour beaucoup de marqueurs
     )
     
-    for i, row in df_route.iterrows():
-        if i == 0:
-            color = 'green'
-            icon = 'play'
-            prefix = 'fa'
-        elif i == len(df_route) - 1:
-            color = 'red'
-            icon = 'stop'
-            prefix = 'fa'
-        else:
-            color = 'blue'
-            icon = 'location-dot'
-            prefix = 'fa'
+    # Couleurs pour les tournées
+    colors = ['blue', 'green', 'purple', 'darkred', 'orange', 'cadetblue', 'darkgreen']
+    
+    # Ajouter les tournées
+    for tour_idx, tour_df in enumerate(all_tours):
+        color = colors[tour_idx % len(colors)]
+        
+        # Points et route
+        coords = tour_df[['lat', 'lon']].values.tolist()
+        
+        # Ligne de la tournée
+        folium.PolyLine(
+            coords,
+            color=color,
+            weight=3,
+            opacity=0.8
+        ).add_to(m)
+        
+        # Marqueurs principaux seulement (début et fin)
+        folium.Marker(
+            location=coords[0],
+            popup=f"Tournée {tour_idx + 1} - Départ",
+            icon=folium.Icon(color=color, icon='play', prefix='fa')
+        ).add_to(m)
         
         folium.Marker(
-            location=[row['lat'], row['lon']],
-            popup=f"""
-            <b>Ordre: {i+1}</b><br>
-            {row.get('adresse_complete', 'Adresse')}<br>
-            <i>Distance depuis précédent: {row.get('distance_etape', 'N/A'):.1f} km</i>
-            """,
-            tooltip=f"Stop {i+1}",
-            icon=folium.Icon(color=color, icon=icon, prefix=prefix)
+            location=coords[-1],
+            popup=f"Tournée {tour_idx + 1} - Arrivée",
+            icon=folium.Icon(color=color, icon='stop', prefix='fa')
         ).add_to(m)
+        
+        # Points intermédiaires en cercles pour performance
+        for i, coord in enumerate(coords[1:-1], 1):
+            folium.CircleMarker(
+                location=coord,
+                radius=5,
+                popup=f"T{tour_idx + 1}-{i+1}",
+                color=color,
+                fill=True,
+                fillColor=color
+            ).add_to(m)
     
-    route_coords = [[row['lat'], row['lon']] for _, row in df_route.iterrows()]
-    folium.PolyLine(
-        route_coords,
-        color='purple',
-        weight=3,
-        opacity=0.8,
-        smooth_factor=2
-    ).add_to(m)
-    
+    # Hors secteur
     if df_out_sector is not None and len(df_out_sector) > 0:
         for _, row in df_out_sector.iterrows():
             folium.Marker(
                 location=[row['lat'], row['lon']],
-                popup=f"""
-                <b>HORS SECTEUR</b><br>
-                {row.get('adresse_complete', 'Adresse')}<br>
-                <i>Distance du centre: {row.get('distance_from_center', 'N/A'):.1f} km</i>
-                """,
-                tooltip="Hors secteur",
-                icon=folium.Icon(color='orange', icon='exclamation-triangle', prefix='fa')
+                popup="Hors secteur",
+                icon=folium.Icon(color='red', icon='exclamation', prefix='fa')
             ).add_to(m)
-    
-    legend_html = '''
-    <div style="position: fixed; 
-                top: 10px; right: 10px; width: 200px; height: auto;
-                background-color: white; z-index: 1000; 
-                border: 2px solid grey; border-radius: 5px;
-                padding: 10px; font-size: 14px;">
-        <p style="margin: 0; font-weight: bold;">Légende</p>
-        <p style="margin: 5px 0;"><i class="fa fa-play" style="color:green;"></i> Départ</p>
-        <p style="margin: 5px 0;"><i class="fa fa-location-dot" style="color:blue;"></i> Livraison</p>
-        <p style="margin: 5px 0;"><i class="fa fa-stop" style="color:red;"></i> Arrivée</p>
-        <p style="margin: 5px 0;"><i class="fa fa-exclamation-triangle" style="color:orange;"></i> Hors secteur</p>
-    </div>
-    '''
-    m.get_root().html.add_child(folium.Element(legend_html))
     
     return m
 
-def optimize_route_nearest_neighbor(df_points):
-    """Optimisation par plus proche voisin améliorée"""
-    if len(df_points) <= 1:
-        return df_points.index.tolist()
-    
-    center_lat = df_points['lat'].mean()
-    center_lon = df_points['lon'].mean()
-    
-    min_dist = float('inf')
-    start_idx = df_points.index[0]
-    
-    for idx, row in df_points.iterrows():
-        dist = geodesic((center_lat, center_lon), (row['lat'], row['lon'])).kilometers
-        if dist < min_dist:
-            min_dist = dist
-            start_idx = idx
-    
-    route = [start_idx]
-    unvisited = set(df_points.index) - {start_idx}
-    
-    while unvisited:
-        current_idx = route[-1]
-        current_coords = (df_points.at[current_idx, 'lat'], df_points.at[current_idx, 'lon'])
-        
-        nearest_idx = None
-        nearest_dist = float('inf')
-        
-        for idx in unvisited:
-            point_coords = (df_points.at[idx, 'lat'], df_points.at[idx, 'lon'])
-            dist = geodesic(current_coords, point_coords).kilometers
-            
-            if dist < nearest_dist:
-                nearest_dist = dist
-                nearest_idx = idx
-        
-        route.append(nearest_idx)
-        unvisited.remove(nearest_idx)
-    
-    return route
-
-def calculate_route_distances(df_route):
-    """Calcule les distances entre chaque étape"""
-    distances = []
-    cumulative_dist = 0
-    
-    for i in range(len(df_route)):
-        if i == 0:
-            distances.append(0)
-        else:
-            coord1 = (df_route.iloc[i-1]['lat'], df_route.iloc[i-1]['lon'])
-            coord2 = (df_route.iloc[i]['lat'], df_route.iloc[i]['lon'])
-            dist = geodesic(coord1, coord2).kilometers
-            distances.append(dist)
-            cumulative_dist += dist
-    
-    df_route['distance_etape'] = distances
-    df_route['distance_cumulee'] = df_route['distance_etape'].cumsum()
-    
-    return df_route, cumulative_dist
-
-def detect_columns_smart(df):
-    """Détection intelligente des colonnes"""
-    columns = df.columns.tolist()
-    
-    address_keywords = ['adresse', 'address', 'rue', 'street', 'voie', 'client', 'nom', 'lieu']
-    postal_keywords = ['postal', 'cp', 'code', 'zip', 'postcode']
-    city_keywords = ['ville', 'city', 'commune', 'localite', 'locality']
-    
-    address_col = None
-    postal_col = None
-    city_col = None
-    
-    for col in columns:
-        col_lower = col.lower()
-        
-        if not address_col:
-            for keyword in address_keywords:
-                if keyword in col_lower:
-                    address_col = col
-                    break
-        
-        if not postal_col:
-            for keyword in postal_keywords:
-                if keyword in col_lower:
-                    postal_col = col
-                    break
-        
-        if not city_col:
-            for keyword in city_keywords:
-                if keyword in col_lower:
-                    city_col = col
-                    break
-    
-    return address_col, postal_col, city_col
-
-def generate_excel_file(df_optimized, df_out_sector, df_failed, total_distance, estimated_time):
-    """Génère le fichier Excel avec toutes les données"""
+# Génération Excel optimisée
+def generate_excel_optimized(all_tours, df_out_sector, df_failed, address_col, postal_col, city_col):
+    """Génération Excel avec structure optimisée"""
     output = io.BytesIO()
     
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        # Préparation de la feuille principale
-        export_main = df_optimized.copy()
-        export_main.insert(0, 'Ordre', range(1, len(export_main) + 1))
-        export_main['Secteur'] = 'Principal'
-        export_main['Distance étape (km)'] = export_main['distance_etape'].round(1)
-        export_main['Heure estimée'] = pd.to_datetime('08:00:00') + pd.to_timedelta(
-            export_main.index * 5 + export_main['distance_cumulee'] * 3, unit='minutes'
-        )
-        export_main['Heure estimée'] = export_main['Heure estimée'].dt.strftime('%H:%M')
+        # Synthèse globale en première page
+        summary_data = []
+        total_distance_global = 0
+        total_addresses = 0
         
-        # Colonnes à garder
-        cols_to_keep = ['Ordre', 'Secteur'] + [col for col in export_main.columns if col in ['adresse', 'address', 'rue', 'street', 'voie', 'client', 'nom', 'lieu']]
-        cols_to_keep += [col for col in export_main.columns if any(keyword in col.lower() for keyword in ['postal', 'cp', 'code', 'zip'])]
-        cols_to_keep += [col for col in export_main.columns if any(keyword in col.lower() for keyword in ['ville', 'city', 'commune'])]
-        cols_to_keep += ['Distance étape (km)', 'Heure estimée', 'lat', 'lon']
+        for idx, tour in enumerate(all_tours):
+            dist = tour['distance_etape'].sum() if 'distance_etape' in tour.columns else 0
+            total_distance_global += dist
+            total_addresses += len(tour)
+            
+            summary_data.append({
+                'Tournée': idx + 1,
+                'Adresses': len(tour),
+                'Distance (km)': round(dist, 1),
+                'Temps estimé': f"{int((dist*3 + len(tour)*5)//60)}h{int((dist*3 + len(tour)*5)%60)}min"
+            })
         
-        # Éliminer les doublons
-        cols_to_keep = list(dict.fromkeys([col for col in cols_to_keep if col in export_main.columns]))
+        # Page synthèse
+        df_summary = pd.DataFrame(summary_data)
+        df_summary.to_excel(writer, sheet_name='Synthèse', index=False)
         
-        export_main[cols_to_keep].to_excel(writer, index=False, sheet_name='Itinéraire_Optimisé')
+        # Une feuille par tournée
+        for idx, tour in enumerate(all_tours):
+            sheet_name = f'Tournée_{idx + 1}'
+            
+            # Préparer les données
+            export_df = tour.copy()
+            export_df.insert(0, 'Ordre', range(1, len(export_df) + 1))
+            
+            # Colonnes essentielles
+            cols = ['Ordre', address_col, postal_col, city_col]
+            
+            if 'distance_etape' in export_df.columns:
+                export_df['Distance (km)'] = export_df['distance_etape'].round(1)
+                cols.append('Distance (km)')
+            
+            # Coordonnées GPS
+            export_df['GPS'] = export_df.apply(lambda row: f"{row['lat']:.6f}, {row['lon']:.6f}", axis=1)
+            cols.append('GPS')
+            
+            export_df[cols].to_excel(writer, sheet_name=sheet_name, index=False)
         
-        # Feuille des adresses hors secteur
+        # Hors secteur
         if len(df_out_sector) > 0:
-            export_out = df_out_sector.copy()
-            export_out['Secteur'] = 'HORS SECTEUR'
-            export_out['Distance du centre (km)'] = export_out['distance_from_center'].round(1)
-            export_out.to_excel(writer, index=False, sheet_name='Hors_Secteur')
+            out_df = df_out_sector[[address_col, postal_col, city_col, 'distance_from_center']].copy()
+            out_df['Distance centre (km)'] = out_df['distance_from_center'].round(1)
+            out_df.drop('distance_from_center', axis=1, inplace=True)
+            out_df.to_excel(writer, sheet_name='Hors_Secteur', index=False)
         
-        # Feuille des échecs
+        # Échecs
         if len(df_failed) > 0:
-            df_failed.to_excel(writer, index=False, sheet_name='Échecs_Géolocalisation')
-        
-        # Feuille de synthèse
-        summary_data = {
-            'Métrique': ['Total adresses', 'Adresses géolocalisées', 'Dans le secteur', 'Hors secteur', 
-                        'Distance totale (km)', 'Temps estimé (min)', 'Heure de départ', 'Heure d\'arrivée'],
-            'Valeur': [len(df_optimized) + len(df_out_sector) + len(df_failed), 
-                      len(df_optimized) + len(df_out_sector), 
-                      len(df_optimized), 
-                      len(df_out_sector),
-                      round(total_distance, 1), 
-                      int(estimated_time), 
-                      '08:00',
-                      (pd.to_datetime('08:00:00') + pd.to_timedelta(estimated_time, unit='minutes')).strftime('%H:%M')]
-        }
-        pd.DataFrame(summary_data).to_excel(writer, index=False, sheet_name='Synthèse')
+            df_failed[[address_col, postal_col, city_col]].to_excel(
+                writer, sheet_name='Échecs', index=False
+            )
     
     output.seek(0)
     return output
 
-# Interface principale - Upload de fichier
-st.markdown("### 📁 Importez votre fichier Excel")
-
-uploaded_file = st.file_uploader(
-    "Glissez-déposez votre fichier contenant les adresses clients",
-    type=["xlsx", "xls"],
-    help="Format requis : colonnes Adresse, Code Postal et Ville",
-    key="file_uploader"
-)
-
-# Si des résultats existent déjà, les afficher
-if st.session_state.processing_done and st.session_state.df_optimized is not None:
-    st.markdown("---")
-    st.success("✅ **Itinéraire déjà calculé !** Descendez pour voir les résultats ou importez un nouveau fichier.")
+# Fonction principale de traitement
+def process_addresses(df, address_col, postal_col, city_col, progress_container):
+    """Traitement principal optimisé"""
+    # Nettoyage des données
+    df_clean = df.dropna(subset=[address_col, postal_col, city_col]).copy()
+    df_clean[postal_col] = df_clean[postal_col].astype(str).str.extract('(\d{5})')[0]
+    df_clean = df_clean.dropna(subset=[postal_col])
     
-    # Section de téléchargement en haut pour éviter le scroll
-    st.markdown("""
-    <div class="download-section">
-        <h3 style="margin: 0 0 1rem 0;">📥 Téléchargement disponible</h3>
-        <p style="margin: 0;">Votre fichier Excel optimisé est prêt !</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # Limiter à 250 adresses
+    if len(df_clean) > 250:
+        df_clean = df_clean.head(250)
+        st.warning("⚠️ Limitation à 250 adresses appliquée")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"tournee_optimisee_{timestamp}.xlsx"
-    
-    st.download_button(
-        label="📥 **Télécharger le fichier Excel optimisé**",
-        data=st.session_state.excel_data,
-        file_name=filename,
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        type="primary",
-        use_container_width=True,
-        key="download_top"
+    # Construction des adresses complètes
+    df_clean['adresse_complete'] = (
+        df_clean[address_col].astype(str).str.strip() + ", " + 
+        df_clean[postal_col].astype(str) + " " + 
+        df_clean[city_col].astype(str).str.strip() + ", France"
     )
     
-    # Affichage des résultats sauvegardés
-    st.markdown("### 📊 Résultats de l'optimisation")
-    
-    # Métriques
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("📦 Livraisons", len(st.session_state.df_optimized))
-    with col2:
-        st.metric("📏 Distance totale", f"{st.session_state.total_distance:.1f} km")
-    with col3:
-        estimated_time = st.session_state.total_distance * 3 + len(st.session_state.df_optimized) * 5
-        st.metric("⏱️ Temps estimé", f"{int(estimated_time//60)}h {int(estimated_time%60)}min")
-    with col4:
-        st.metric("⚠️ Hors secteur", len(st.session_state.df_out_sector))
-    
-    # Carte
-    st.markdown("### 🗺️ Visualisation de la tournée")
-    if st.session_state.map_data:
-        st_folium(st.session_state.map_data, height=500, use_container_width=True, key="map_saved")
-    
-    # Tableau de l'itinéraire
-    st.markdown("### 📋 Détail de l'itinéraire")
-    df_display = st.session_state.df_optimized.copy()
-    df_display.insert(0, 'Ordre', range(1, len(df_display) + 1))
-    
-    # Sélection des colonnes à afficher
-    cols_to_display = ['Ordre']
-    for col in df_display.columns:
-        if any(keyword in col.lower() for keyword in ['adresse', 'address', 'client', 'postal', 'cp', 'ville', 'city']):
-            if col not in cols_to_display:
-                cols_to_display.append(col)
-    
-    if 'distance_etape' in df_display.columns:
-        df_display['Distance étape'] = df_display['distance_etape'].round(1).astype(str) + ' km'
-        cols_to_display.append('Distance étape')
-    
-    st.dataframe(df_display[cols_to_display], use_container_width=True, hide_index=True)
-    
-    st.markdown("---")
-
-# Traitement du nouveau fichier
-if uploaded_file:
-    # Réinitialiser si un nouveau fichier est uploadé
-    if 'last_uploaded_file' not in st.session_state or st.session_state.last_uploaded_file != uploaded_file.name:
-        st.session_state.processing_done = False
-        st.session_state.last_uploaded_file = uploaded_file.name
-    
-    try:
-        df = pd.read_excel(uploaded_file)
-        st.success(f"✅ Fichier importé : **{len(df)} adresses** détectées")
-    except Exception as e:
-        st.error(f"❌ Erreur : {e}")
-        st.stop()
-    
-    # Aperçu
-    with st.expander("📊 Aperçu des données", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
-    
-    # Détection des colonnes
-    address_col, postal_col, city_col = detect_columns_smart(df)
-    
-    if not all([address_col, postal_col, city_col]):
-        st.warning("⚠️ Sélection manuelle des colonnes requise")
-        
-        col1, col2, col3 = st.columns(3)
-        columns = df.columns.tolist()
-        
-        with col1:
-            address_col = st.selectbox("📍 Adresse", columns, key="addr_col")
-        with col2:
-            postal_col = st.selectbox("📮 Code Postal", columns, key="postal_col")
-        with col3:
-            city_col = st.selectbox("🏙️ Ville", columns, key="city_col")
-    else:
-        st.info(f"✅ Colonnes détectées : **{address_col}**, **{postal_col}**, **{city_col}**")
-    
-    # Bouton de traitement
-    if st.button("🚀 **Générer l'itinéraire optimisé**", type="primary", use_container_width=True, key="process_btn"):
-        
-        # Nettoyage
-        df_clean = df.dropna(subset=[address_col, postal_col, city_col]).copy()
-        df_clean[postal_col] = df_clean[postal_col].astype(str).str.extract('(\d+)')[0]
-        df_clean = df_clean[df_clean[address_col].astype(str).str.strip() != '']
-        df_clean = df_clean[df_clean[city_col].astype(str).str.strip() != '']
-        
-        # Construction des adresses
-        df_clean['adresse_complete'] = (
-            df_clean[address_col].astype(str) + ", " + 
-            df_clean[postal_col].astype(str) + " " + 
-            df_clean[city_col].astype(str) + ", France"
-        )
-        
-        # Géocodage
-        st.markdown("### 🌍 Géolocalisation en cours...")
+    # Géocodage
+    with progress_container.container():
+        st.markdown("### 🌍 Géolocalisation des adresses")
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        coordinates = []
-        geocoding_success = []
-        total = min(len(df_clean), 100)  # Limite gratuite
+        # Géocodage parallèle
+        coordinates = batch_geocode_parallel(
+            df_clean['adresse_complete'].tolist(),
+            progress_bar,
+            status_text
+        )
+    
+    # Ajouter les résultats
+    df_clean[['lat', 'lon', 'geocoding_success']] = pd.DataFrame(coordinates)
+    
+    # Séparer succès/échecs
+    df_geocoded = df_clean[df_clean['geocoding_success'] == True].copy()
+    df_failed = df_clean[df_clean['geocoding_success'] == False].copy()
+    
+    if len(df_geocoded) < 2:
+        raise ValueError("Pas assez d'adresses géolocalisées pour créer un itinéraire")
+    
+    # Détection des hors secteur
+    in_sector_idx, out_sector_idx = detect_outliers_advanced(df_geocoded)
+    df_sector = df_geocoded.loc[in_sector_idx].copy()
+    df_out_sector = df_geocoded.loc[out_sector_idx].copy()
+    
+    if len(df_sector) < 2:
+        raise ValueError("Pas assez d'adresses dans le secteur principal")
+    
+    # Création des tournées
+    with progress_container.container():
+        st.markdown("### 🚛 Optimisation des tournées")
+        progress_bar2 = st.progress(0)
         
-        if len(df_clean) > 100:
-            st.warning("⚠️ Limitation à 100 adresses (API gratuite)")
-            df_clean = df_clean.head(100)
+        tours = create_multiple_tours(df_sector, max_per_tour=50)
+        all_tours_optimized = []
         
-        for i, address in enumerate(df_clean['adresse_complete']):
-            progress = (i + 1) / total
-            progress_bar.progress(progress)
-            status_text.text(f"Traitement : {i+1}/{total}")
+        for i, tour in enumerate(tours):
+            progress_bar2.progress((i + 1) / len(tours))
             
-            lat, lon, success = geocode_address(address)
-            coordinates.append((lat, lon))
-            geocoding_success.append(success)
+            # Optimiser chaque tournée
+            optimal_order = optimize_route_2opt(tour)
+            tour_optimized = tour.loc[optimal_order].reset_index(drop=True)
             
-            time.sleep(1.1)
-        
-        df_clean[['lat', 'lon']] = pd.DataFrame(coordinates)
-        df_clean['geocoding_success'] = geocoding_success
-        
-        # Séparation des résultats
-        df_geocoded = df_clean[df_clean['geocoding_success'] == True].dropna(subset=['lat', 'lon']).copy()
-        df_failed = df_clean[df_clean['geocoding_success'] == False].copy()
-        
-        if len(df_geocoded) < 2:
-            st.error("❌ Pas assez d'adresses géolocalisées")
-            st.stop()
-        
-        # Détection des hors secteur
-        with st.spinner("Analyse du secteur..."):
-            in_sector_idx, out_sector_idx = find_outliers_using_mad(df_geocoded)
-        
-        df_sector = df_geocoded.loc[in_sector_idx].copy()
-        df_out_sector = df_geocoded.loc[out_sector_idx].copy()
-        
-        # Optimisation
-        with st.spinner("Optimisation de l'itinéraire..."):
-            optimal_order = optimize_route_nearest_neighbor(df_sector)
-            df_optimized = df_sector.loc[optimal_order].reset_index(drop=True)
-            df_optimized, total_distance = calculate_route_distances(df_optimized)
-        
-        # Génération de la carte
-        folium_map = create_folium_map(df_optimized, df_out_sector)
-        
-        # Génération du fichier Excel
-        estimated_time = total_distance * 3 + len(df_optimized) * 5
-        excel_data = generate_excel_file(df_optimized, df_out_sector, df_failed, total_distance, estimated_time)
-        
-        # Sauvegarde dans session state
-        st.session_state.processing_done = True
-        st.session_state.df_optimized = df_optimized
-        st.session_state.df_out_sector = df_out_sector
-        st.session_state.df_failed = df_failed
-        st.session_state.total_distance = total_distance
-        st.session_state.excel_data = excel_data
-        st.session_state.map_data = folium_map
-        
-        # Forcer le rechargement pour afficher les résultats
-        st.rerun()
+            # Calculer les distances
+            distances = [0]
+            for j in range(1, len(tour_optimized)):
+                coord1 = (tour_optimized.iloc[j-1]['lat'], tour_optimized.iloc[j-1]['lon'])
+                coord2 = (tour_optimized.iloc[j]['lat'], tour_optimized.iloc[j]['lon'])
+                distances.append(geodesic(coord1, coord2).kilometers)
+            
+            tour_optimized['distance_etape'] = distances
+            all_tours_optimized.append(tour_optimized)
+    
+    return all_tours_optimized, df_out_sector, df_failed
 
-# Message d'attente si pas de fichier
-if not uploaded_file and not st.session_state.processing_done:
-    st.markdown("""
-    <div class="results-container">
-        <h4>📋 Format attendu du fichier Excel :</h4>
-        <ul>
-            <li><b>Colonne Adresse :</b> Numéro et nom de rue</li>
-            <li><b>Colonne Code Postal :</b> Code postal à 5 chiffres</li>
-            <li><b>Colonne Ville :</b> Nom de la commune</li>
-        </ul>
-        <p style="margin-top: 1rem; color: #666;">
-            <i>💡 Le système détectera automatiquement les colonnes et identifiera les adresses hors secteur</i>
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
+# Interface principale
+def main():
+    # Zone de fichier
+    st.markdown("### 📁 Importez votre fichier Excel")
+    
+    uploaded_file = st.file_uploader(
+        "Glissez-déposez votre fichier (max 250 adresses)",
+        type=["xlsx", "xls"],
+        help="Format : colonnes Adresse, Code Postal et Ville",
+        key="file_uploader"
+    )
+    
+    # Container pour les résultats
+    results_container = st.container()
+    progress_container = st.empty()
+    
+    # Si des résultats existent, les afficher en premier
+    if st.session_state.processing_status == 'completed' and 'results' in st.session_state:
+        with results_container:
+            results = st.session_state.results
+            
+            # Zone de téléchargement
+            st.markdown('<div class="download-ready">', unsafe_allow_html=True)
+            st.markdown("### ✅ Vos tournées sont prêtes !")
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.download_button(
+                    label="📥 **Télécharger le fichier Excel**",
+                    data=results['excel_data'],
+                    file_name=f"tournees_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    type="primary",
+                    use_container_width=True
+                )
+            with col2:
+                if st.button("🔄 Nouveau", type="secondary"):
+                    st.session_state.processing_status = 'idle'
+                    st.session_state.results = {}
+                    st.rerun()
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Statistiques
+            st.markdown("### 📊 Statistiques")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("🚛 Tournées", results['n_tours'])
+            with col2:
+                st.metric("📦 Adresses", results['n_addresses'])
+            with col3:
+                st.metric("📏 Distance totale", f"{results['total_distance']:.1f} km")
+            with col4:
+                st.metric("⚠️ Hors secteur", results['n_out_sector'])
+            
+            # Détails par tournée
+            st.markdown("### 🗺️ Détails des tournées")
+            
+            for idx, tour in enumerate(results['tours']):
+                tour_dist = tour['distance_etape'].sum()
+                tour_time = tour_dist * 3 + len(tour) * 5
+                
+                with st.expander(f"Tournée {idx + 1} - {len(tour)} adresses - {tour_dist:.1f} km", expanded=(idx == 0)):
+                    # Afficher les premières adresses
+                    display_cols = [col for col in tour.columns if any(
+                        kw in col.lower() for kw in ['adresse', 'postal', 'ville']
+                    )]
+                    
+                    if display_cols:
+                        st.dataframe(
+                            tour[display_cols].head(10),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        if len(tour) > 10:
+                            st.info(f"... et {len(tour) - 10} autres adresses")
+            
+            # Carte
+            if 'map' in results and results['map']:
+                st.markdown("### 🗺️ Visualisation")
+                st_folium(results['map'], height=600, use_container_width=True)
+    
+    # Traitement du fichier
+    if uploaded_file and st.session_state.processing_status != 'processing':
+        # Calculer le hash du fichier
+        file_content = uploaded_file.read()
+        uploaded_file.seek(0)
+        file_hash = hashlib.md5(file_content).hexdigest()
+        
+        # Vérifier si c'est un nouveau fichier
+        if file_hash != st.session_state.current_file_hash:
+            st.session_state.current_file_hash = file_hash
+            st.session_state.processing_status = 'idle'
+            st.session_state.results = {}
+        
+        # Lire le fichier
+        try:
+            df = pd.read_excel(uploaded_file)
+            st.success(f"✅ Fichier chargé : {len(df)} adresses")
+        except Exception as e:
+            st.error(f"❌ Erreur : {str(e)}")
+            return
+        
+        # Détection des colonnes
+        address_col, postal_col, city_col = detect_columns_smart(df)
+        
+        # Interface de sélection si nécessaire
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            address_col = st.selectbox(
+                "📍 Colonne Adresse",
+                df.columns.tolist(),
+                index=df.columns.tolist().index(address_col) if address_col else 0
+            )
+        with col2:
+            postal_col = st.selectbox(
+                "📮 Code Postal",
+                df.columns.tolist(),
+                index=df.columns.tolist().index(postal_col) if postal_col else 0
+            )
+        with col3:
+            city_col = st.selectbox(
+                "🏙️ Ville",
+                df.columns.tolist(),
+                index=df.columns.tolist().index(city_col) if city_col else 0
+            )
+        
+        # Bouton de traitement
+        if st.button("🚀 **Optimiser les tournées**", type="primary", use_container_width=True):
+            st.session_state.processing_status = 'processing'
+            
+            try:
+                # Traitement principal
+                all_tours, df_out_sector, df_failed = process_addresses(
+                    df, address_col, postal_col, city_col, progress_container
+                )
+                
+                # Générer les résultats
+                with progress_container.container():
+                    st.info("📊 Génération des fichiers...")
+                    
+                    # Excel
+                    excel_data = generate_excel_optimized(
+                        all_tours, df_out_sector, df_failed,
+                        address_col, postal_col, city_col
+                    )
+                    
+                    # Carte
+                    map_data = create_optimized_map(all_tours, df_out_sector)
+                    
+                    # Calculer les statistiques
+                    total_distance = sum(tour['distance_etape'].sum() for tour in all_tours)
+                    total_addresses = sum(len(tour) for tour in all_tours)
+                
+                # Sauvegarder les résultats
+                st.session_state.results = {
+                    'tours': all_tours,
+                    'excel_data': excel_data,
+                    'map': map_data,
+                    'n_tours': len(all_tours),
+                    'n_addresses': total_addresses,
+                    'n_out_sector': len(df_out_sector),
+                    'total_distance': total_distance
+                }
+                
+                st.session_state.processing_status = 'completed'
+                
+                # Rafraîchir pour afficher les résultats
+                st.rerun()
+                
+            except Exception as e:
+                st.session_state.processing_status = 'idle'
+                st.session_state.error_message = str(e)
+                st.error(f"❌ Erreur : {str(e)}")
+    
+    # Instructions si pas de fichier
+    elif not uploaded_file and st.session_state.processing_status == 'idle':
+        st.info("""
+        ### 📋 Comment utiliser l'application :
+        
+        1. **Importez** votre fichier Excel (max 250 adresses)
+        2. **Vérifiez** que les colonnes sont correctement détectées
+        3. **Cliquez** sur "Optimiser les tournées"
+        4. **Téléchargez** le fichier Excel avec les itinéraires
+        
+        **Format requis :** Adresse, Code Postal, Ville
+        """)
 
 # Footer
 st.markdown("""
 <div class="footer">
     <p style="margin: 0; font-size: 1.1rem;">🚛 Optimisateur de Tournées Logistiques</p>
-    <p style="margin: 0.5rem 0; opacity: 0.9;">Solution 100% gratuite • Géolocalisation automatique • Export Excel</p>
+    <p style="margin: 0.5rem 0; opacity: 0.9;">Solution 100% gratuite • Jusqu'à 250 adresses • Performance optimisée</p>
     <p style="margin: 0.5rem 0 0 0; opacity: 0.8;">Par l'alternant Delestret Kim</p>
 </div>
 """, unsafe_allow_html=True)
+
+# Lancer l'application
+if __name__ == "__main__":
+    main()
